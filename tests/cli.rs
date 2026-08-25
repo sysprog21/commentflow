@@ -32,11 +32,12 @@ fn run(args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
-    // A run that rejects its arguments exits before it ever reads stdin, so this
-    // write races that exit and loses whenever the child wins: EPIPE. That is
-    // the binary behaving correctly, and the assertions that follow are about
-    // the exit code and stderr, which wait_with_output still collects. Only a
-    // real I/O failure is worth failing a test over.
+
+    // A run that rejects its arguments exits before it ever reads stdin, so
+    // this write races that exit and loses whenever the child wins: EPIPE. That
+    // is the binary behaving correctly, and the assertions that follow are
+    // about the exit code and stderr, which wait_with_output still collects.
+    // Only a real I/O failure is worth failing a test over.
     let mut stdin = child.stdin.take().unwrap();
     if let Err(e) = stdin.write_all(input)
         && e.kind() != std::io::ErrorKind::BrokenPipe

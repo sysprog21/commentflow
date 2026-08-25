@@ -86,6 +86,24 @@ const VOCAB: &[&str] = &[
     "@len:",
     "@epsilon",
     ":",
+    // Bare words that double as Doxygen tag keywords. A param declared with one
+    // of these ("@param note") makes a later "@note" spell exactly like the
+    // reference "is_param_xref" exempts, so its "DOXY_TAGS" membership test is
+    // the only thing keeping a real section out of the preceding param's
+    // description. Without these in the vocabulary the collision is
+    // ungeneratable.
+    //
+    // Both need a BARE tag token above to collide with, which is why "file" is
+    // not here despite being the most realistic collision of the three: the
+    // only file-shaped token is the path "@file.txt", and "kdoc_xref_name"
+    // rejects it on the dot, so it aborts as a foreign tag whether or not a
+    // param shares the name. Adding a bare "@file" makes the collision
+    // generatable and immediately trips a pre-existing blank-line bug unrelated
+    // to the exemption, so the file case is pinned by hand instead, in
+    // "kernel_doc_param_cross_reference_is_description_text" and
+    // "doxygen_section_tag_survives_a_param_of_the_same_name".
+    "note",
+    "warning",
     // Tag names outside "[A-Za-z]", which "is_foreign_tag" does not claim.
     "@1buf",
     "@1buf:",

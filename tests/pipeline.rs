@@ -804,6 +804,209 @@ fn doxygen_param_converts_to_kernel_doc() {
 }
 
 #[test]
+fn doxygen_param_cross_reference_survives_conversion() {
+    // A comment that cross-references its own arguments in prose ("a multiple
+    // of @align") used to abort the whole conversion, since any "@word" that is
+    // not @param/@return read as a foreign tag. Shape from tlsf-bsd's tlsf.h.
+    // The narrow limit forces the references across wrap boundaries, where
+    // "common::pipeline"'s second-pass assertion is the real test.
+    let src = "/**\n * Allocate memory with a specified alignment.\n *\n * @param t the allocator\n * @param align alignment in bytes, a power of two\n * @param size bytes wanted; need not be a multiple of @align\n * @return pointer aligned to @align, or NULL on failure\n */\nvoid *f(void *t, size_t align, size_t size);\n";
+    let out = pipeline(src, detect("foo.c"), 56);
+
+    assert!(
+        out.contains(" * @align : alignment in bytes"),
+        "params must convert, got:\n{out}"
+    );
+    assert!(
+        !out.contains("@param") && !out.contains("@return"),
+        "no Doxygen param/return tag may survive, got:\n{out}"
+    );
+
+    // Both prose references survive as words. Where reflow parks them is not
+    // pinned here: a bare "@align" is not a tag any pass eats, and making the
+    // packer keep it off a continuation-line start cost a fixed point.
+    assert_eq!(
+        out.matches("@align").count(),
+        3,
+        "one declaration plus both references must survive, got:\n{out}"
+    );
+    assert!(
+        out.contains("aligned to"),
+        "the return description must survive, got:\n{out}"
+    );
+}
+
+#[test]
+fn doxygen_backslash_param_cross_reference_survives_conversion() {
+    let src = "/**\n * \\param size bytes wanted\n * \\return pointer to \\size, or NULL on failure\n */\nvoid *f(size_t size);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+
+    assert!(
+        out.contains(" * @size : bytes wanted")
+            && out.contains("Return pointer to \\size, or NULL on failure"),
+        "backslash parameter references must convert, got:\n{out}"
+    );
+    assert!(!out.contains("\\param") && !out.contains("\\return"));
+}
+
+#[test]
+fn doxygen_foreign_tag_still_aborts_despite_a_prose_param_mention() {
+    // Head prose mentioning "@param note" is not a declaration, so the real
+    // "@note" section below stays foreign and the whole comment passes through
+    // rather than folding "@note" into "@x"'s description.
+    let src = "/**\n * Pass @param note to the logger when tracing.\n *\n * @param x the x value\n * @note beware of the reentrancy hazard\n */\nint f(int x);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(out, src, "a foreign @note must leave the comment untouched");
+}
+
+#[test]
+fn doxygen_section_tag_survives_a_param_of_the_same_name() {
+    // "file" is an ordinary C parameter name and also a Doxygen section tag.
+    // The name is what disqualifies it as a cross-reference, so the section
+    // survives and the whole comment passes through rather than folding
+    // "writer.c" into the param.
+    let src = "/**\n * @param file the output stream\n * @file writer.c\n * @return count\n */\nint f(void *file);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, src,
+        "a real @file section must leave the comment alone"
+    );
+}
+
+#[test]
+fn doxygen_section_tag_survives_a_reflow_that_merges_its_line() {
+    // The same collision in a comment with no doc flavor, where nothing marks
+    // "@file" as a tag line and reflow packs the whole body onto one line. A
+    // position-based reference test read the merged "@file" as running prose
+    // and converted on the SECOND run what the first refused, folding the
+    // section into the param description. "common::pipeline" asserts the fixed
+    // point, so the merge here is the whole test.
+    let src = "/*\n * @param file the output stream\n * @file writer.c\n */\nint f(void *file);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert!(
+        out.contains("@param file") && out.contains("@file writer.c"),
+        "a merged @file section must still abort the conversion, got:\n{out}"
+    );
+}
+
+#[test]
+fn doxygen_param_declares_a_name_that_wrapped_off_its_tag_line() {
+    // "@param" ending a line takes its name off the line below, exactly as the
+    // entry scan reads it. Collected per line the name went undeclared, so the
+    // "@size" reference read as a foreign tag and aborted; reflow then rejoined
+    // the tag and its name, and the next run converted. One run has to do it.
+    let src = "/**\n * @param\n * size the size in bytes\n * @return a multiple of @size\n */\nvoid *f(size_t size);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert!(
+        out.contains(" * @size : the size in bytes"),
+        "the wrapped param must convert on the first run, got:\n{out}"
+    );
+    assert!(
+        out.contains("Return a multiple of @size"),
+        "the reference must ride along as description text, got:\n{out}"
+    );
+}
+
+#[test]
+fn doxygen_param_named_after_a_convertible_tag_passes_through() {
+    // "@param return desc" would emit "@return : desc", which the next run
+    // reads as a return tag and rewrites again to "Return : desc". A param name
+    // that is itself a convertible keyword cannot round-trip, so the comment
+    // passes through instead.
+    let src = "/**\n * @param return the return slot\n */\nint f(int *ret);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(out, src, "a param named \"return\" must not convert");
+}
+
+#[test]
+fn kernel_doc_entry_hangs_its_continuations_under_the_description() {
+    // The form "convert_kernel_doc" emits wraps under the description column,
+    // the same way a "@param" entry does. Shape from tlsf-bsd's tlsf.h.
+    let src = "/**\n * @prev : Pointer to the previous physical block. Only valid when the previous block is free; physically stored at the tail of that block's payload.\n * @header : Size or status bits.\n */\nstruct b { int prev; };\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    // Assert the column rather than a hardcoded run of spaces: the
+    // continuation must begin exactly under "Pointer".
+    let lines: Vec<&str> = out.lines().collect();
+    let head = lines.iter().position(|l| l.contains("@prev :")).unwrap();
+    let desc_col = lines[head].find("Pointer").unwrap();
+    let cont_col = lines[head + 1].find("block is free;").unwrap();
+    assert_eq!(
+        cont_col, desc_col,
+        "continuation must align under the description column, got:\n{out}"
+    );
+    // A short entry that never wraps keeps its single line.
+    assert!(
+        out.contains("\n * @header : Size or status bits.\n"),
+        "an entry that fits must not gain an indent, got:\n{out}"
+    );
+}
+
+#[test]
+fn packer_never_forges_a_kernel_doc_tag_mid_paragraph() {
+    // A lone "@buf" that takes a ":"-led word on a continuation line would be
+    // a tag line the source never had. "classify_lines" splits a paragraph at
+    // one, so the next pass regroups the text and the hanging indent moves
+    // with it. The harness's second-pass assertion is the real test here.
+    let src = "/**\n * alpha beta gamma delta epsilon zeta eta theta iota kappa @buf : lambda mu\n */\nint f(int buf);\n";
+    let out = pipeline(src, detect("foo.c"), 46);
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("* @buf :")),
+        "reflow must not open a continuation line with a forged tag, got:\n{out}"
+    );
+}
+
+#[test]
+fn packer_never_splits_a_kernel_doc_entry_from_its_colon() {
+    // The mirror: a name long enough to fill the opening line must still keep
+    // its ":" , overflowing if it has to. A first line ending at "@name" is
+    // not a tag line on the next pass, so the entry would dissolve.
+    let src = "/**\n * lead words here\n * @destination_buffer_length : alpha beta gamma delta epsilon\n */\nint f(int destination_buffer_length);\n";
+    let out = pipeline(src, detect("foo.c"), 34);
+    assert!(
+        out.contains("* @destination_buffer_length :"),
+        "the name must keep its colon, got:\n{out}"
+    );
+}
+
+#[test]
+fn packer_never_borrows_a_tag_onto_a_continuation_line() {
+    // A paragraph ending in a bare rule borrows a word from the line above so
+    // the rule is not stranded there, and that borrowed word OPENS the last
+    // line, which is a continuation. Borrowing a tag onto it is the same defect
+    // the tag rule prevents at every other break: "classify_lines" reads a tag
+    // at the first column as its own tag paragraph, the next pass regroups
+    // around it, and the hanging indent moves with the regrouping. Invisible
+    // while a kernel-doc entry wrapped flush; the moment it hangs, the regroup
+    // moves bytes and the file settles only on its second run.
+    //
+    // The trailing "---" is an em-dash, the shape the bookend rules exist for.
+    // "common::pipeline" asserts the fixed point, so the borrow is the test.
+    let src =
+        "/**\n * @buf : destination for the decoded bytes, see @note ---\n */\nint f(int x);\n";
+    let out = pipeline(src, detect("foo.c"), 24);
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("* @note")),
+        "the borrow must not open a continuation line with a tag, got:\n{out}"
+    );
+}
+
+#[test]
+fn a_rule_never_goes_out_alone_behind_a_one_word_line() {
+    // The other way out of the borrow: the line above holds a single word, so
+    // there is no space to split it at and nothing to lend. The fold arm has to
+    // catch that, because falling through emits the rule alone, and the next
+    // pass reads a line that is nothing but a rule run as a bare decorative
+    // rule and DELETES it. A deleted word is the one outcome worth overflowing
+    // a line to avoid.
+    let src = "/**\n * @param[in] warning multiple beta reallyquitelongword ---\n */\nvoid *f(void *t);\n";
+    let out = pipeline(src, detect("foo.c"), 25);
+    assert!(
+        out.contains("reallyquitelongword ---"),
+        "the rule must ride out on the line above, got:\n{out}"
+    );
+}
+
+#[test]
 fn mid_paragraph_doxygen_param_does_not_lose_tag_in_line_run() {
     let src =
         "int f(void) { return 0; }\n// alpha beta gamma delta epsilon zeta @param eta theta\n";
