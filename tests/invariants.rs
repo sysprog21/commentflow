@@ -320,8 +320,8 @@ fn return_on_own_line_prose_capital() {
 #[test]
 fn return_on_own_line_doxygen_at_return() {
     // C/C++ Doxygen return tags convert to kernel-doc "Return ..." on their own
-    // line, blank-separated. All four spellings (@return, @returns, \return,
-    // \returns) converge to the same output.
+    // line, blank-separated. All four spellings (@return, @returns, \return, \returns)
+    // converge to the same output.
     let src = "#include <stdio.h>\n/**\n * Computes a thing.\n * @return the result of the computation\n */\nint f(void) { return 0; }\n";
     let out = pipeline(src, detect("foo.c"), 80);
     assert_kernel_doc_return(&out);
@@ -1192,9 +1192,9 @@ fn rustdoc_doc_flavor_cpp_uses_doxygen() {
 
 #[test]
 fn rustdoc_doc_flavor_rs_treats_at_param_as_prose() {
-    // Same "///" + "@param ..." text in a .rs file. Under Rustdoc flavor,
-    // @param is just prose: continuation is flush-left under "/// ", NOT
-    // description-column aligned.
+    // Same "///" + "@param ..." text in a .rs file. Under Rustdoc
+    // flavor, @param is just prose: continuation is flush-left under "/// ",
+    // NOT description-column aligned.
     let src = "/// Computes a thing.\n/// @param widget the widget object that needs careful operation here in this rust file using prose semantics\nfn f(widget: i32) -> i32 { widget }\n";
     let out = pipeline(src, detect("foo.rs"), 80);
     let cont = out

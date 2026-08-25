@@ -1,6 +1,6 @@
 use crate::classify::{DocFlavor, Kind, Style};
 pub use crate::linekind::LineKind;
-use crate::linekind::{StrippedLine, classify_lines};
+use crate::linekind::{StrippedLine, classify_lines, doxy_tag};
 use crate::parse::{Comment, Language};
 use crate::textline::{
     BookendKind, FAST_PATH_TAB_WIDTH, advance_col, block_is_doc, bookend_match, line_is_art_only,
@@ -704,6 +704,60 @@ fn is_foreign_tag(word: &str) -> bool {
     })
 }
 
+/// Whether a whitespace-delimited word is a cross-reference to one of this
+/// comment's own parameters rather than a Doxygen block tag. Doxygen prose
+/// writes a parameter reference as "@name" ("aligned to @align, or NULL"), the
+/// same spelling a block tag uses, so two things separate them.
+///
+/// The name has to be one the comment declares, and it must not be a Doxygen
+/// tag keyword in its own right: a function with a parameter named "file" or
+/// "note", both ordinary in C and both in "DOXY_TAGS", would otherwise swallow
+/// a real "@file"/"@note" section into the preceding parameter's description
+/// instead of aborting the conversion.
+///
+/// Deliberately position-blind. Line position looks like the sharper
+/// discriminator (a block tag opens a line, a reference in running prose
+/// essentially never does) and it is not, because reflow OWNS line position.
+/// In a comment this aborts on, the next run re-wraps the untouched text and
+/// merges the line-leading "@file" into the line above; a position test then
+/// reads it mid-line as a reference and converts what the run before refused.
+/// That is a two-pass fixed point, which "--check" converges on instead of
+/// reporting. A name-only test cannot move under the packer.
+///
+/// Ceiling: the test is "DOXY_TAGS" membership, and that table is the subset
+/// of Doxygen commands this tool knows, not all of them. A parameter named
+/// after a command outside it ("@param arg" beside an "@arg" list) still reads
+/// the command as a reference and folds it into the description. Widen
+/// "DOXY_TAGS" when a real file needs it.
+fn is_param_xref(word: &str, param_names: &[&str]) -> bool {
+    kdoc_xref_name(word).is_some_and(|name| param_names.contains(&name) && doxy_tag(name).is_none())
+}
+
+/// The parameter name an "@name"/"\\name" cross-reference points at, or "None" if the
+/// word cannot be one. Trailing punctuation is trimmed, since a reference at a
+/// clause break ("@align,") is still a reference.
+///
+/// Both Doxygen spellings are supported, except one-character C escapes such
+/// as "\\n"; the name must otherwise open like a C identifier, so "\\0"
+/// cannot be a reference.
+fn kdoc_xref_name(word: &str) -> Option<&str> {
+    let kw = word.strip_prefix(['@', '\\'])?;
+    let name = kw.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+
+    // After the trim, not before: prose ends a clause, and "\\n." is the same
+    // escape as "\\n". Checking the untrimmed word let a trailing period decide
+    // whether a comment converted at all.
+    if word.starts_with('\\') && matches!(name, "a" | "b" | "e" | "f" | "n" | "r" | "t" | "v") {
+        return None;
+    }
+    let starts_like_ident = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (starts_like_ident && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
 /// Split a prose line at a mid-line Doxygen return tag, using the very splitter
 /// reflow uses so the two cannot disagree.
 ///
@@ -783,17 +837,6 @@ fn convert_kernel_doc(lines: Vec<Line>, lang: Language) -> Vec<Line> {
         return lines;
     }
 
-    // A whitespace-delimited tag token we don't convert, ANYWHERE in the
-    // comment (head included), aborts the conversion. Scanning the whole
-    // comment, not just the tag region, keeps a "@brief"/"@note" in the leading
-    // description from being silently preserved beside converted params.
-    let has_foreign_tag = lines
-        .iter()
-        .any(|l| l.text.split_whitespace().any(is_foreign_tag));
-    if has_foreign_tag {
-        return lines;
-    }
-
     // The region opens at the first line that BEGINS with a tag. A tag that
     // only appears mid-line marks prose describing the tag, not a doc block.
     let Some(first) = lines.iter().position(|l| {
@@ -804,6 +847,46 @@ fn convert_kernel_doc(lines: Vec<Line>, lang: Language) -> Vec<Line> {
     }) else {
         return lines;
     };
+
+    // A whitespace-delimited tag token we don't convert, ANYWHERE in the
+    // comment (head included), aborts the conversion. Scanning the whole
+    // comment, not just the tag region, keeps a "@brief"/"@note" in the leading
+    // description from being silently preserved beside converted params. ...
+    // except a reference to one of this comment's OWN params. Doxygen prose
+    // says "a multiple of @align", and kernel-doc keeps that spelling, so
+    // treating it as a foreign tag aborted every function comment that
+    // cross-references its arguments (the common case, not a corner). Collect
+    // the declared names first, then let those words ride along as description
+    // text. Names come from the tag region ONLY, the same first-word rule that
+    // opens it: head prose saying "pass @param note to the logger" declares
+    // nothing.
+    //
+    // The scan reads the region's words as ONE stream rather than line by line,
+    // because that is how the entry scan below reads a name: a "@param" ending
+    // a line takes its name off the line after. Restarting per line missed that
+    // name, so the comment aborted, and the next run (reflow having rejoined
+    // the two) converted it: a two-pass fixed point.
+    let has_foreign_tag = {
+        let mut param_names: Vec<&str> = Vec::new();
+        let mut words = lines[first..]
+            .iter()
+            .flat_map(|l| l.text.split_whitespace());
+        while let Some(w) = words.next() {
+            if matches!(kdoc_tag_of(w), Some(KTag::Param))
+                && let Some(n) = words.next().filter(|n| is_kdoc_name(n))
+            {
+                param_names.push(n);
+            }
+        }
+        lines.iter().any(|l| {
+            l.text
+                .split_whitespace()
+                .any(|w| is_foreign_tag(w) && !is_param_xref(w, &param_names))
+        })
+    };
+    if has_foreign_tag {
+        return lines;
+    }
 
     // Reduce the tag region (first tag line to end) to (tag, description-words)
     // entries. "bail" keeps "lines" intact so we can return it untouched.
@@ -844,8 +927,15 @@ fn convert_kernel_doc(lines: Vec<Line>, lang: Language) -> Vec<Line> {
             at_line_start = false;
         }
     }
+
+    // A param name that is itself a convertible tag keyword cannot round-trip:
+    // "@param return desc" emits "@return : desc", which the NEXT run reads as
+    // a return tag and rewrites again to "Return : desc". Pass through instead.
     let bad_param = entries.iter().any(|(tag, desc)| {
-        matches!(tag, KTag::Param) && !desc.first().is_some_and(|n| is_kdoc_name(n))
+        matches!(tag, KTag::Param)
+            && !desc
+                .first()
+                .is_some_and(|n| is_kdoc_name(n) && kdoc_tag_of_keyword(n).is_none())
     });
     if bail || bad_param {
         return lines;
@@ -1239,6 +1329,156 @@ mod tests {
             ("@param x the x", LineKind::Prose),
         ]);
         assert_eq!(convert_bodies(lines), vec!["@x : the x", "", "Return zero"]);
+    }
+
+    #[test]
+    fn kdoc_xref_name_forms() {
+        assert_eq!(kdoc_xref_name("@align"), Some("align"));
+        assert_eq!(kdoc_xref_name("\\align"), Some("align"));
+        // Trailing punctuation at a clause break does not hide the reference.
+        assert_eq!(kdoc_xref_name("@align,"), Some("align"));
+        assert_eq!(kdoc_xref_name("@size."), Some("size"));
+        assert_eq!(kdoc_xref_name("@_x)"), Some("_x"));
+        // Escape sequences and names beginning with a digit are not references.
+        assert_eq!(kdoc_xref_name("\\n"), None);
+        assert_eq!(kdoc_xref_name("\\0"), None);
+        // Trailing punctuation must not smuggle an escape past the check: a
+        // clause ends with "\\n." as readily as it ends with "\\n".
+        assert_eq!(kdoc_xref_name("\\n."), None);
+        assert_eq!(kdoc_xref_name("\\t,"), None);
+        // The "@" spelling is unambiguous, so a param really named "n" works.
+        assert_eq!(kdoc_xref_name("@n"), Some("n"));
+        // A name cannot open with a digit, and "@" alone names nothing.
+        assert_eq!(kdoc_xref_name("@0"), None);
+        assert_eq!(kdoc_xref_name("@"), None);
+        assert_eq!(kdoc_xref_name("plain"), None);
+        // A path shape is not a reference even though it opens with a tag
+        // keyword: the dot leaves "file.txt" outside the identifier grammar.
+        assert_eq!(kdoc_xref_name("@file.txt"), None);
+    }
+
+    #[test]
+    fn kernel_doc_param_cross_reference_is_description_text() {
+        // "@align" in prose names a param this comment declares, so it is a
+        // cross-reference, not a foreign tag: it rides along as description
+        // text instead of aborting the conversion. Trailing punctuation
+        // ("@align,") does not hide the reference. Shape from tlsf.h.
+        let lines = mk_lines(&[
+            ("@param align Alignment in bytes", LineKind::Prose),
+            (
+                "@param size Need not be a multiple of @align",
+                LineKind::Prose,
+            ),
+            ("@return Aligned to @align, or NULL", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(lines),
+            vec![
+                "@align : Alignment in bytes",
+                "@size : Need not be a multiple of @align",
+                "",
+                "Return Aligned to @align, or NULL",
+            ]
+        );
+
+        // A tag naming something the comment does NOT declare is still foreign,
+        // and still aborts.
+        let undeclared = mk_lines(&[
+            ("@param x the x", LineKind::Prose),
+            ("@return bounded by @limit", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(undeclared),
+            vec!["@param x the x", "@return bounded by @limit"]
+        );
+
+        // Head prose that merely mentions "@param note" declares nothing: the
+        // region opens at the first line whose FIRST word is a tag, and names
+        // are collected from there on. A real "@note" below is still foreign
+        // and still aborts, instead of being folded into "@x"'s description.
+        let prose_mention = mk_lines(&[
+            ("Pass @param note to the logger.", LineKind::Prose),
+            ("@param x the x", LineKind::Prose),
+            ("@note beware", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(prose_mention),
+            vec![
+                "Pass @param note to the logger.",
+                "@param x the x",
+                "@note beware",
+            ]
+        );
+
+        // A param named after a real Doxygen tag does not turn that tag into a
+        // reference: the name is in DOXY_TAGS, so the whole comment aborts
+        // rather than folding "writer.c" into "@file"'s description. The name
+        // is the discriminator, not the position, because the position moves:
+        // reflow merges the aborted comment's lines and the next run would read
+        // the very same "@file" mid-line.
+        let collision = mk_lines(&[
+            ("@param file the output stream", LineKind::Prose),
+            ("@file writer.c", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(collision),
+            vec!["@param file the output stream", "@file writer.c"]
+        );
+
+        // Same name, mid-line: the name still decides, so this aborts too.
+        let midline = mk_lines(&[
+            ("@param file the output stream", LineKind::Prose),
+            ("Opened before @file is read.", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(midline),
+            vec![
+                "@param file the output stream",
+                "Opened before @file is read."
+            ]
+        );
+
+        // The ceiling, pinned so it is a decision and not a surprise: a param
+        // named after a Doxygen command DOXY_TAGS does not list reads as a
+        // reference wherever it sits, so a real "@foo" section folds into the
+        // description. Position cannot rescue this (it is not stable under
+        // reflow); widening DOXY_TAGS can.
+        let custom_collision = mk_lines(&[
+            ("@param foo the output stream", LineKind::Prose),
+            ("@foo custom section", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(custom_collision),
+            vec!["@foo : the output stream @foo custom section"]
+        );
+
+        // The name scan reads the region as one word stream, so a "@param"
+        // ending a line still declares the name that opens the next one. Read
+        // line by line, "size" went undeclared, the comment aborted, and the
+        // run after (reflow having rejoined the two) converted it.
+        let wrapped_decl = mk_lines(&[
+            ("@param", LineKind::Prose),
+            ("size the size in bytes", LineKind::Prose),
+            ("@return a multiple of @size", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(wrapped_decl),
+            vec![
+                "@size : the size in bytes",
+                "",
+                "Return a multiple of @size",
+            ]
+        );
+
+        // Trailing punctuation does not smuggle an undeclared name through.
+        let undeclared_punct = mk_lines(&[
+            ("@param x the x", LineKind::Prose),
+            ("bounded by @limit, roughly", LineKind::Prose),
+        ]);
+        assert_eq!(
+            convert_bodies(undeclared_punct),
+            vec!["@param x the x", "bounded by @limit, roughly"]
+        );
     }
 
     #[test]

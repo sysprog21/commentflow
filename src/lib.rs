@@ -128,14 +128,14 @@ fn blank_line_before(
         return None;
     }
 
-    // One parser for the two "#" lines that mean "this comment is not explaining
-    // me". Splitting them was how the BOM strip below ended up on only one of
-    // the pair, which left a BOM'd file whose first line is "#ifndef GUARD"
-    // failing a test its BOM-free twin passes. U+FEFF is not Unicode
-    // White_Space, so "trim" leaves it glued to the "#".
+    // One parser for the two "#" lines that mean "this comment is not
+    // explaining me". Splitting them was how the BOM strip below ended up on
+    // only one of the pair, which left a BOM'd file whose first line is
+    // "#ifndef GUARD" failing a test its BOM-free twin passes. U+FEFF is not
+    // Unicode White_Space, so "trim" leaves it glued to the "#".
     //
-    // - "#!" on line 1 of a SHELL file is the file's preamble. The header below it
-    //   belongs flush against it, and without this the rule fires on
+    // - "#!" on line 1 of a SHELL file is the file's preamble. The header
+    //   below it belongs flush against it, and without this the rule fires on
     //   essentially every shell script in existence, detaching its header from
     //   line 1 and splitting a "#! nix-shell -i bash" run off the shebang it
     //   belongs to, which some interpreters require. Gated on "prev_start == 0"
@@ -152,7 +152,7 @@ fn blank_line_before(
     {
         // "#!" takes "rest" untrimmed: a shebang is the two bytes "#!" with
         // nothing between them, so "# !x" is an ordinary comment. The
-        // directives take the trimmed form, because "#  if" is valid cpp.
+        // directives take the trimmed form, because "# if" is valid cpp.
         //
         // Shell only, and that gate is load-bearing rather than tidiness:
         // "#![no_std]" is a Rust inner attribute in exactly the same position,

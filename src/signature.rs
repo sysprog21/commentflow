@@ -85,8 +85,9 @@ fn detect_param_drift(
             trailing.push(child);
         }
     }
-    // Exactly one, which is what the tell means: a single comment displaced
-    // off the end of the list. Two or more after ")" is not one-step drift, and
+
+    // Exactly one, which is what the tell means: a single comment displaced off
+    // the end of the list. Two or more after ")" is not one-step drift, and
     // shifting them all onto the last parameter invents a grouping the author
     // never wrote. The doc comment above has always said "exactly one"; the
     // code only checked "at least one".

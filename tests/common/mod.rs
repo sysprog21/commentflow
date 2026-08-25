@@ -31,7 +31,10 @@ pub fn pipeline(source: &str, lang: Language, column_limit: usize) -> String {
     // misses.
     let reps2 = commentflow::plan(&out, lang, column_limit, indent_cfg, &mut pool).unwrap();
     let out2 = rewrite::apply(&out, &reps2);
-    assert_eq!(out, out2, "second pass changed the output (not idempotent)");
+    assert_eq!(
+        out, out2,
+        "second pass changed the output (not idempotent)\n--- source\n{source}--- pass 1\n{out}--- pass 2\n{out2}"
+    );
     out
 }
 

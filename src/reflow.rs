@@ -329,6 +329,31 @@ fn doxygen_hanging_indent(body: &str, effective: usize, flavor: DocFlavor) -> us
         return 0;
     }
 
+    // The kernel-doc form "convert_kernel_doc" emits ("@name : desc"). It is
+    // not a tag-table keyword, so the lookup below answers None and its
+    // continuations would wrap flush under the prefix while a "@param" entry's
+    // align under the description column. Both forms sit in one file the moment
+    // one comment converts and its neighbor aborts, so they have to agree.
+    //
+    // Safe only because the packer refuses to forge this shape mid-paragraph
+    // (see "would_forge_kdoc_tag" below). A nonzero hang is what makes an
+    // invented tag line visible: "classify_lines" has always split a paragraph
+    // at one, but with a flush wrap the regrouping moved no bytes.
+    //
+    // The description column is whatever follows the colon and its space. A
+    // name is "[A-Za-z0-9_]+", so everything up to the colon is ASCII and the
+    // byte offset is the column.
+    let trimmed = body.trim_start();
+    if is_kernel_doc_tag(trimmed) {
+        let after_colon = trimmed.find(':').map_or(0, |i| i + 1);
+        let indent = after_colon + usize::from(trimmed[after_colon..].starts_with(' '));
+        return if effective <= indent + MIN_WRAP_WIDTH {
+            CONTINUATION_INDENT
+        } else {
+            indent
+        };
+    }
+
     // Both spellings of a tag, "@param" and "\param", align the same way: strip
     // whichever marker is there and look the bare keyword up in the one tag
     // table. A keyword the table doesn't know, or one not followed by a space,
@@ -386,6 +411,16 @@ fn is_tag_start(word: &str) -> bool {
     };
     (doxy_tag(doxy_keyword(rest)).is_some() && !looks_like_email_or_path(rest))
         || is_kernel_doc_tag(word)
+}
+
+/// A line holding nothing but "@name", the one shape a following ":"-led word
+/// turns into the kernel-doc tag form. Every other way to end a line in "@name"
+/// leaves an earlier word in front of it, and "is_kernel_doc_tag" reads the
+/// line start, so those are already safe.
+fn is_lone_kdoc_name(line: &str) -> bool {
+    line.strip_prefix('@').is_some_and(|name| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Greedy line-packing of one paragraph. The first line goes out behind
@@ -446,13 +481,43 @@ fn wrap_segment_aligned(
             last_word = None;
             continue;
         }
+
         // Appending is never guarded, only finalizing is. A line that packing
         // turned into a bookend ("-------- x --------") cannot escape: either a
         // later word does not fit, and the emit guard below refuses to send it
         // out, or the paragraph ends on it and the borrow at the bottom does.
         // Checking here as well was tried and deleted; it failed no test that
         // those two do not already cover, and it cost a scan per word.
-        if current_width + 1 + w_width <= avail {
+        //
+        // The one exception to "appending is never guarded", and it decides the
+        // append outright rather than voting on it: a lone "@name" about to
+        // take a ":"-led word is the kernel-doc tag shape, and which line it
+        // sits on is the whole question. Width does not get a say either way.
+        //
+        // On a CONTINUATION line the join FORGES a tag the source never had,
+        // and "classify_lines" splits a paragraph at one: the next pass
+        // regroups the text around it and the hanging indent moves with the
+        // regrouping. Falling through emits "@name" on its own and opens the
+        // next line with the ":" word, which loses nothing and breaks one word
+        // early. Guarding the finalize path instead cannot work here the way it
+        // does for bookends: "is_kernel_doc_tag" reads the line START, so once
+        // a line holds "@name :" no further word clears it and "keep packing"
+        // never terminates. The forging step is the only place to stand.
+        //
+        // On the paragraph's OPENING line the join is mandatory, because
+        // "@name" and its ":" are one unit: a first line stopping at "@name" is
+        // not a tag line on the next pass, so the paragraph merges into the one
+        // above and the hang goes with it. Overflow instead, the same trade the
+        // tag rule takes: an over-long line is recoverable, a regrouped one
+        // settles a run late.
+        let kdoc_colon_pending =
+            last_word.is_none() && w.starts_with(':') && is_lone_kdoc_name(&current);
+        let takes_word = if kdoc_colon_pending {
+            on_first_line
+        } else {
+            current_width + 1 + w_width <= avail
+        };
+        if takes_word {
             last_word = Some(current.len() + 1);
             current.push(' ');
             current.push_str(w);
@@ -462,8 +527,8 @@ fn wrap_segment_aligned(
 
         // Past here the word does not fit, so a line is going out.
 
-        // Never hand the next pass a line the bookend stripper would rewrite.
-        // A rule token in prose ("a --- b") that a narrow wrap leaves alone on
+        // Never hand the next pass a line the bookend stripper would rewrite. A
+        // rule token in prose ("a --- b") that a narrow wrap leaves alone on
         // its line reads as a bare rule on the next run and is deleted, so the
         // file settles only on the second one. Same trade as the tag rule
         // below: keep packing and overflow, because an over-long line is
@@ -486,10 +551,10 @@ fn wrap_segment_aligned(
             // That only works when the word moved down is not itself a tag;
             // otherwise the break just relocates the problem. With no such
             // word, let the line overflow. An over-long line is recoverable, a
-            // deleted word is not.
-            // Peeling must not undo the bookend guard above: breaking "--- x"
-            // in front of a tag emits "---" alone, which is the very line that
-            // guard exists to prevent. Fall through to the overflow arm.
+            // deleted word is not. Peeling must not undo the bookend guard
+            // above: breaking "--- x" in front of a tag emits "---" alone,
+            // which is the very line that guard exists to prevent. Fall through
+            // to the overflow arm.
             match last_word {
                 Some(start)
                     if !is_tag_start(&current[start..])
@@ -520,12 +585,13 @@ fn wrap_segment_aligned(
     if current.is_empty() {
         return;
     }
+
     // The same rule at the paragraph's end, where there is no next word to pack
-    // with. Borrow one from the line above so the rule is not alone, taking care
-    // that neither resulting line is a bookend either: folding the rule straight
-    // onto "-------- x y" would build the two-sided banner this is avoiding.
-    // Only the paragraph's first line has nothing to borrow from, and a
-    // paragraph that is one bare rule was the stripper's business long before
+    // with. Borrow one from the line above so the rule is not alone, taking
+    // care that neither resulting line is a bookend either: folding the rule
+    // straight onto "-------- x y" would build the two-sided banner this is
+    // avoiding. Only the paragraph's first line has nothing to borrow from, and
+    // a paragraph that is one bare rule was the stripper's business long before
     // reflow saw it.
     //
     // The tests below take the line above as a BODY, not as the emitted line.
@@ -544,16 +610,30 @@ fn wrap_segment_aligned(
             .strip_prefix(prev_prefix)
             .unwrap_or(&out[last])
             .to_string();
-        if let Some(space) = prev_body.rfind(' ') {
-            let kept = &prev_body[..space];
-            let joined = format!("{} {current}", &prev_body[space + 1..]);
-            if bookend_match(kept).is_none() && bookend_match(&joined).is_none() {
-                out[last] = format!("{prev_prefix}{kept}");
-                current = joined;
-            } else if bookend_match(&format!("{prev_body} {current}")).is_none() {
-                out[last] = format!("{prev_prefix}{prev_body} {current}");
-                return;
-            }
+
+        // The borrowed word opens the paragraph's last line, and that line is
+        // always a continuation, so the tag rule above applies to it just as it
+        // does to a mid-paragraph break: a tag parked at the first column is
+        // read by "classify_lines" as its own tag paragraph, the next pass
+        // regroups around it, and the hanging indent moves with the regrouping.
+        //
+        // When there is nothing to borrow, or borrowing would build one of the
+        // shapes above, fold the rule onto the line above whole. That arm used
+        // to sit inside the "there is a word to borrow" case, so a line holding
+        // ONE word (no space to split at) fell through and emitted the rule
+        // alone anyway, which the next pass reads as a bare rule and deletes.
+        let borrow = prev_body.rfind(' ').filter(|&space| {
+            let borrowed = &prev_body[space + 1..];
+            !is_tag_start(borrowed)
+                && bookend_match(&prev_body[..space]).is_none()
+                && bookend_match(&format!("{borrowed} {current}")).is_none()
+        });
+        if let Some(space) = borrow {
+            out[last] = format!("{prev_prefix}{}", &prev_body[..space]);
+            current = format!("{} {current}", &prev_body[space + 1..]);
+        } else if bookend_match(&format!("{prev_body} {current}")).is_none() {
+            out[last] = format!("{prev_prefix}{prev_body} {current}");
+            return;
         }
     }
     let line_prefix = if out.len() == first_line_mark {
