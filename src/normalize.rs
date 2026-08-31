@@ -196,13 +196,29 @@ pub fn normalize(
 /// line. Returns the comment text, or "None" when there is nothing to split
 /// (single-line, "*/" already alone, or no content before the closer).
 ///
+/// Horizontal whitespace between the last clause and the closer goes with the
+/// closer: emitting it would leave the line trailing spaces, which is not a
+/// shape this tool produces anywhere else, and the same trim has always applied
+/// on the trailing-block path. It costs nothing even on the ACSL rail, where
+/// the bytes are otherwise untouchable, because whitespace between two tokens
+/// is not a token: verified against Frama-C 33, which prints the same AST
+/// either way. Whitespace INSIDE the body is never reached, so a string literal
+/// ending in spaces keeps them.
+///
+/// Crate-private on purpose. "plan" is the only caller and the closer-indent
+/// override is an implementation detail of the two rails that use it, not an
+/// API to hold still for.
+///
 /// "closer_indent" is the indentation for the new closer line. "None" reuses
 /// the last line's own indentation, which lands "*/" under the continuation
 /// "*" marker when one is present, else under the content. An ACSL annotation
 /// has no "*" markers and indents its clauses under the "/*@ " text column, so
 /// that rule would park the closer mid-line; the caller passes the comment's
 /// own indent plus one space instead, putting "*/" under the opener's "*".
-pub fn split_trailing_block_closer(text: &str, closer_indent: Option<&str>) -> Option<String> {
+pub(crate) fn split_trailing_block_closer(
+    text: &str,
+    closer_indent: Option<&str>,
+) -> Option<String> {
     let nl = text.rfind('\n')?;
     let (prefix, last_line) = (&text[..=nl], &text[nl + 1..]);
 
@@ -1265,6 +1281,20 @@ mod tests {
         assert_eq!(split_trailing_block_closer("/* foo */", None), None);
         // Empty last line (bare closer with only a marker) stays put.
         assert_eq!(split_trailing_block_closer("/* foo\n     * */", None), None);
+        // Whitespace between the last clause and the closer goes with the
+        // closer rather than being left to trail the line.
+        assert_eq!(
+            split_trailing_block_closer("/*@ requires x;\n    assigns y;\t  */", Some(" "))
+                .as_deref(),
+            Some("/*@ requires x;\n    assigns y;\n */")
+        );
+        // Whitespace inside the body is never reached: a string literal that
+        // ends in spaces keeps them.
+        assert_eq!(
+            split_trailing_block_closer("/*@ ghost\n  char *s = \"a   \";   */", Some(" "))
+                .as_deref(),
+            Some("/*@ ghost\n  char *s = \"a   \";\n */")
+        );
         // CRLF endings are preserved.
         assert_eq!(
             split_trailing_block_closer("/* foo\r\n     * bar. */", None).as_deref(),

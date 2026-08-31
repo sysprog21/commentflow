@@ -115,7 +115,7 @@ fn pipeline_skips_rust_nested_block() {
 fn pipeline_skips_frama_c_acsl_bodies() {
     let src = "/*@ requires n >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result >= 0;\n  */\nint f(int n);\n//@ assert x >= 0;\n";
     let out = pipeline(src, detect("foo.c"), 30);
-    assert_eq!(src, out, "an ACSL body must stay byte-identical");
+    assert_eq!(src, out, "an ACSL body keeps every token");
 }
 
 #[test]
@@ -128,6 +128,16 @@ fn pipeline_splits_glued_acsl_closer() {
         out, "/*@ requires \\valid(p);\n    assigns *p;\n */\nvoid f(int *p);\n",
         "a glued ACSL closer moves to its own line"
     );
+    // Whitespace in front of the closer moves with it rather than being left
+    // to trail the line. No token changes: whitespace between two tokens is not
+    // one, and whitespace inside the body is never reached.
+    let src = "/*@ ghost\n  char *s = \"a   \";\t  */\nvoid g(void);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, "/*@ ghost\n  char *s = \"a   \";\n */\nvoid g(void);\n",
+        "the gap before the closer goes with the closer"
+    );
+
     // Indented annotation: the closer follows the comment's own indent.
     let src = "    /*@ assigns *p;\n        ensures *p == 0; */\n";
     let out = pipeline(src, detect("foo.c"), 80);

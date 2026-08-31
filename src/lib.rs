@@ -270,9 +270,9 @@ pub fn plan(
         let Some(doc) = normalize::normalize(c, &kind, lang, column_limit) else {
             // Two kinds of block comment skip reflow but still get a glued
             // closing "*/" split onto its own line: trailing blocks, and ACSL
-            // annotations. An ACSL body is parser-visible syntax that must stay
-            // byte-identical (see "is_acsl_annotation"), but the closer's line
-            // is pure layout: Frama-C reads whitespace as whitespace, and the
+            // annotations. An ACSL body is parser-visible syntax and no token
+            // of it may change (see "is_acsl_annotation"), but the closer's
+            // line is pure layout: Frama-C reads whitespace as whitespace, and
             // multi-line form is spelled with "*/" alone on the last line. The
             // closer lands under the opener's "*" rather than under the clause
             // column, which is where the last line's own indent would put it.
