@@ -675,6 +675,50 @@ pub(crate) fn is_passthrough_directive(text: &str, lang: Language) -> bool {
         || is_lint_directive(text, lang)
 }
 
+/// True when a comment is pinned as passthrough for the ACSL reason and *only*
+/// that reason, and its closing "*/" may be moved onto its own line.
+///
+/// "force_passthrough" is one bit standing for several unrelated reasons, so
+/// "this is an ACSL annotation" does not mean "ACSL is why it is pinned". A
+/// bare CR still makes any rewrite unsafe (every visual line after the first is
+/// inside the node, so the emitted text is not what it looks like), and an
+/// annotation carrying a cppcheck suppression on an interior line is pinned by
+/// that suppression too. Each reason keeps its own veto.
+///
+/// The other two directive rails cannot co-occur with ACSL and are not tested
+/// for: "is_formatter_directive" and "is_lint_directive" both read the FIRST
+/// line, and both strip only "/" and "*" off it, so the "@" of "/*@" survives
+/// and their keyword match can never fire on an annotation. Only cppcheck's
+/// rail scans every line, which is what puts it within reach.
+///
+/// The last line must carry real annotation text before the "*/", and the
+/// closer must not be spelled "@*/". Splint annotations ride the same "/*@"
+/// prefix and "@*/" is Splint's REQUIRED closing delimiter, so splitting it
+/// deletes the delimiter; the same spelling is the idiomatic "@"-marker ACSL
+/// closer, where splitting only strands a bare "@" on a line of its own. One
+/// rule covers both: a closer that already carries its marker is left alone.
+///
+/// Trailing annotations are excluded. "line_indent_bytes" is empty for a
+/// comment that shares its line with code, so the closer would land at column 1
+/// instead of under the opener's "*".
+pub(crate) fn acsl_closer_split_allowed(source: &str, c: &Comment, lang: Language) -> bool {
+    if !matches!(lang, Language::C | Language::Cpp) || !is_acsl_annotation(&c.text) {
+        return false;
+    }
+    if c.is_trailing
+        || spans_bare_cr(source, c.start_byte, c.end_byte)
+        || is_cppcheck_suppress(&c.text)
+    {
+        return false;
+    }
+    let last = c.text.rsplit('\n').next().unwrap_or("").trim_end();
+    if last.ends_with("@*/") {
+        return false;
+    }
+    last.strip_suffix("*/")
+        .is_some_and(|before| !before.trim().trim_matches(['@', '*']).is_empty())
+}
+
 fn is_verbatim_open(trimmed: &str) -> bool {
     ["@code", "\\code", "@verbatim", "\\verbatim"]
         .iter()

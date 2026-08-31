@@ -171,6 +171,17 @@ fn shapes(body: &str) -> Vec<(&'static str, String)> {
         ("foo.rs", format!("fn f() {{}}\n// {body}\n")),
         ("foo.sh", format!("f() {{ :; }}\n# {body}\n")),
         ("foo.S", format!("nop\n/* {body} */\n")),
+        // ACSL, both closer spellings. The glued "*/" is split onto its own
+        // line and must land on a fixed point; the "@*/" form is vetoed and
+        // must come back byte-identical.
+        (
+            "foo.c",
+            format!("/*@ requires x;\n    {body} */\nint f(void);\n"),
+        ),
+        (
+            "foo.c",
+            format!("/*@ requires x;\n  @ {body}\n  @*/\nint f(void);\n"),
+        ),
     ]
 }
 

@@ -40,7 +40,11 @@ Tool directives stay intact. `// clang-format off`, `// NOLINT`,
 `cppcheck-suppress`, Frama-C ACSL `/*@ ... */`, `// IWYU pragma:`,
 `# shellcheck disable=`, `/// cbindgen:`, and similar directives are machine
 instructions, not prose. Reflowing one can move it away from the line it guards,
-so these comments pass through untouched.
+so these comments pass through untouched. The one layout fix applied to a
+multi-line Frama-C ACSL block is moving a glued closing `*/` onto its own line,
+under the opener's `*`; the annotation body itself stays byte for byte. A
+closer already spelled `@*/` is left alone, since that is Splint's required
+delimiter and the idiomatic `@`-marker ACSL closer.
 
 No build context required. Parsing is Tree-sitter-based, so each file is
 analyzed on its own. There are no translation units, include paths,
