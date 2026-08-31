@@ -268,15 +268,28 @@ pub fn plan(
         }
         let kind = classify::classify(&c.text, lang);
         let Some(doc) = normalize::normalize(c, &kind, lang, column_limit) else {
-            // Trailing block comments skip reflow, but a glued closing "*/" on
-            // the last line still gets split onto its own line.
-            if !c.force_passthrough
-                && c.is_trailing
-                && matches!(
-                    kind.style,
-                    classify::Style::Block | classify::Style::DocBlock
-                )
-                && let Some(text) = normalize::split_trailing_block_closer(&c.text)
+            // Two kinds of block comment skip reflow but still get a glued
+            // closing "*/" split onto its own line: trailing blocks, and ACSL
+            // annotations. An ACSL body is parser-visible syntax and no token
+            // of it may change (see "is_acsl_annotation"), but the closer's
+            // line is pure layout: Frama-C reads whitespace as whitespace, and
+            // multi-line form is spelled with "*/" alone on the last line. The
+            // closer lands under the opener's "*" rather than under the clause
+            // column, which is where the last line's own indent would put it.
+            // "acsl_closer_split_allowed" holds the guards: every OTHER reason
+            // a comment can be pinned as passthrough still vetoes the split.
+            let closer_indent = if parse::acsl_closer_split_allowed(source, c, lang) {
+                Some(format!("{} ", c.line_indent_bytes))
+            } else if !c.force_passthrough && c.is_trailing {
+                None
+            } else {
+                continue;
+            };
+            if matches!(
+                kind.style,
+                classify::Style::Block | classify::Style::DocBlock
+            ) && let Some(text) =
+                normalize::split_trailing_block_closer(&c.text, closer_indent.as_deref())
                 && let Some(replacement) = rewrite::make_replacement(c, text, source)
             {
                 out.push(replacement);

@@ -112,10 +112,125 @@ fn pipeline_skips_rust_nested_block() {
 }
 
 #[test]
-fn pipeline_skips_frama_c_acsl_annotations() {
+fn pipeline_skips_frama_c_acsl_bodies() {
     let src = "/*@ requires n >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result >= 0;\n  */\nint f(int n);\n//@ assert x >= 0;\n";
     let out = pipeline(src, detect("foo.c"), 30);
-    assert_eq!(src, out, "ACSL annotations must stay byte-identical");
+    assert_eq!(src, out, "an ACSL body keeps every token");
+}
+
+#[test]
+fn pipeline_splits_glued_acsl_closer() {
+    // The annotation body is parser-visible syntax and must survive verbatim;
+    // only the glued "*/" moves, landing under the opener's "*".
+    let src = "/*@ requires \\valid(p);\n    assigns *p; */\nvoid f(int *p);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, "/*@ requires \\valid(p);\n    assigns *p;\n */\nvoid f(int *p);\n",
+        "a glued ACSL closer moves to its own line"
+    );
+    // Whitespace in front of the closer moves with it rather than being left
+    // to trail the line. No token changes: whitespace between two tokens is not
+    // one, and whitespace inside the body is never reached.
+    let src = "/*@ ghost\n  char *s = \"a   \";\t  */\nvoid g(void);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, "/*@ ghost\n  char *s = \"a   \";\n */\nvoid g(void);\n",
+        "the gap before the closer goes with the closer"
+    );
+
+    // Indented annotation: the closer follows the comment's own indent.
+    let src = "    /*@ assigns *p;\n        ensures *p == 0; */\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, "    /*@ assigns *p;\n        ensures *p == 0;\n     */\n",
+        "closer sits under the opener's \"*\""
+    );
+}
+
+#[test]
+fn pipeline_keeps_glued_acsl_closer_when_another_rail_applies() {
+    // Splint rides the same "/*@" prefix and "@*/" is its required closing
+    // delimiter; the same spelling is the idiomatic "@"-marker ACSL closer.
+    let src = "/*@\n  modifies x; @*/\nint x;\n";
+    assert_eq!(
+        pipeline(src, detect("foo.c"), 80),
+        src,
+        "\"@*/\" is left alone"
+    );
+    let src = "/*@ requires x > 0;\n  @ ensures \\result > 0;\n  @*/\nint f(int x);\n";
+    assert_eq!(
+        pipeline(src, detect("foo.c"), 80),
+        src,
+        "\"@*/\" is left alone"
+    );
+
+    // A bare CR pins the comment whatever else it is: every visual line after
+    // the first is inside the node, so no rewrite is safe.
+    let src = "/*@ requires p;\r  ensures q;\n  assigns z; */\nint g(void);\n";
+    assert_eq!(
+        pipeline(src, detect("foo.c"), 80),
+        src,
+        "bare CR still vetoes"
+    );
+
+    // Trailing annotation: "line_indent_bytes" is empty, so the closer would
+    // land at column 1 rather than under the opener's "*".
+    let src = "int x; /*@\n  ensures x == 0; */\n";
+    assert_eq!(
+        pipeline(src, detect("foo.c"), 80),
+        src,
+        "trailing ACSL untouched"
+    );
+
+    // An interior cppcheck suppression pins the annotation on its own rail. The
+    // other two directive rails read the FIRST line and strip only "/" and "*"
+    // off it, so the "@" of "/*@" survives and they can never fire here.
+    let src = "/*@ requires x;\n  cppcheck-suppress nullPointer\n  ensures y; */\nint a;\n";
+    assert_eq!(
+        pipeline(src, detect("foo.c"), 80),
+        src,
+        "interior cppcheck suppression still vetoes"
+    );
+
+    // The language gate is load-bearing, not defensive: these are the two ways
+    // a non-C comment opening with "/*@" reaches the branch at all, via
+    // "rust_block_has_nested" and "spans_bare_cr".
+    let src = "/*@ outer /* inner */\n  more; */\nfn f() {}\n";
+    assert_eq!(
+        pipeline(src, detect("foo.rs"), 80),
+        src,
+        "a Rust nested block is not an annotation"
+    );
+    let src = "/*@ a\r  b; */\n.text\n";
+    assert_eq!(
+        pipeline(src, detect("foo.S"), 80),
+        src,
+        "assembly has no ACSL rail"
+    );
+}
+
+#[test]
+fn paragraph_end_rule_borrows_across_a_stranded_run() {
+    // The paragraph's last word is a rule run, and the line above is rule-led,
+    // so the single-word borrow has no legal cut: taking "@1buf:" parks a
+    // kernel-doc tag at a line start, and the "--------" it leaves behind is a
+    // bare rule the next pass deletes. The borrow reaches two words up and
+    // folds the stranded run onto the line above it instead. "common::pipeline"
+    // asserts the second pass is a no-op, which is what used to fail here.
+    let src = "/* lead one\n *\n * @return: @return/x @param. reallyquitelongword @1buf @param: @return: @note/path gamma @2: @param.txt @1buf -------- \\result @1buf: ***\n */\n";
+    let out = pipeline(src, detect("foo.c"), 27);
+    assert!(
+        out.contains("@param.txt @1buf --------"),
+        "the stranded rule folds onto the line above: {out}"
+    );
+    assert!(
+        out.contains("\\result @1buf: ***"),
+        "and the rule run keeps company on the last line: {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l.trim() == "* ***"),
+        "no line is left as a bare rule for the next pass to delete: {out}"
+    );
 }
 
 #[test]
@@ -924,8 +1039,9 @@ fn kernel_doc_entry_hangs_its_continuations_under_the_description() {
     // the same way a "@param" entry does. Shape from tlsf-bsd's tlsf.h.
     let src = "/**\n * @prev : Pointer to the previous physical block. Only valid when the previous block is free; physically stored at the tail of that block's payload.\n * @header : Size or status bits.\n */\nstruct b { int prev; };\n";
     let out = pipeline(src, detect("foo.c"), 80);
-    // Assert the column rather than a hardcoded run of spaces: the
-    // continuation must begin exactly under "Pointer".
+
+    // Assert the column rather than a hardcoded run of spaces: the continuation
+    // must begin exactly under "Pointer".
     let lines: Vec<&str> = out.lines().collect();
     let head = lines.iter().position(|l| l.contains("@prev :")).unwrap();
     let desc_col = lines[head].find("Pointer").unwrap();
@@ -943,10 +1059,10 @@ fn kernel_doc_entry_hangs_its_continuations_under_the_description() {
 
 #[test]
 fn packer_never_forges_a_kernel_doc_tag_mid_paragraph() {
-    // A lone "@buf" that takes a ":"-led word on a continuation line would be
-    // a tag line the source never had. "classify_lines" splits a paragraph at
-    // one, so the next pass regroups the text and the hanging indent moves
-    // with it. The harness's second-pass assertion is the real test here.
+    // A lone "@buf" that takes a ":"-led word on a continuation line would be a
+    // tag line the source never had. "classify_lines" splits a paragraph at
+    // one, so the next pass regroups the text and the hanging indent moves with
+    // it. The harness's second-pass assertion is the real test here.
     let src = "/**\n * alpha beta gamma delta epsilon zeta eta theta iota kappa @buf : lambda mu\n */\nint f(int buf);\n";
     let out = pipeline(src, detect("foo.c"), 46);
     assert!(
@@ -958,8 +1074,8 @@ fn packer_never_forges_a_kernel_doc_tag_mid_paragraph() {
 #[test]
 fn packer_never_splits_a_kernel_doc_entry_from_its_colon() {
     // The mirror: a name long enough to fill the opening line must still keep
-    // its ":" , overflowing if it has to. A first line ending at "@name" is
-    // not a tag line on the next pass, so the entry would dissolve.
+    // its ":" , overflowing if it has to. A first line ending at "@name" is not
+    // a tag line on the next pass, so the entry would dissolve.
     let src = "/**\n * lead words here\n * @destination_buffer_length : alpha beta gamma delta epsilon\n */\nint f(int destination_buffer_length);\n";
     let out = pipeline(src, detect("foo.c"), 34);
     assert!(

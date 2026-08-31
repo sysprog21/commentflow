@@ -193,11 +193,32 @@ pub fn normalize(
 /// "normalize"), but a multi-line one whose closing "*/" is glued to the last
 /// content line still reads badly, and clang-format won't move it. This is the
 /// one layout fix applied to trailing blocks: split a glued "*/" onto its own
-/// line, reusing the last line's indentation (which lands "*/" under the
-/// continuation "*" marker when one is present, else under the content).
-/// Returns the comment text, or "None" when there is nothing to split
+/// line. Returns the comment text, or "None" when there is nothing to split
 /// (single-line, "*/" already alone, or no content before the closer).
-pub fn split_trailing_block_closer(text: &str) -> Option<String> {
+///
+/// Horizontal whitespace between the last clause and the closer goes with the
+/// closer: emitting it would leave the line trailing spaces, which is not a
+/// shape this tool produces anywhere else, and the same trim has always applied
+/// on the trailing-block path. It costs nothing even on the ACSL rail, where
+/// the bytes are otherwise untouchable, because whitespace between two tokens
+/// is not a token: verified against Frama-C 33, which prints the same AST
+/// either way. Whitespace INSIDE the body is never reached, so a string literal
+/// ending in spaces keeps them.
+///
+/// Crate-private on purpose. "plan" is the only caller and the closer-indent
+/// override is an implementation detail of the two rails that use it, not an
+/// API to hold still for.
+///
+/// "closer_indent" is the indentation for the new closer line. "None" reuses
+/// the last line's own indentation, which lands "*/" under the continuation
+/// "*" marker when one is present, else under the content. An ACSL annotation
+/// has no "*" markers and indents its clauses under the "/*@ " text column, so
+/// that rule would park the closer mid-line; the caller passes the comment's
+/// own indent plus one space instead, putting "*/" under the opener's "*".
+pub(crate) fn split_trailing_block_closer(
+    text: &str,
+    closer_indent: Option<&str>,
+) -> Option<String> {
     let nl = text.rfind('\n')?;
     let (prefix, last_line) = (&text[..=nl], &text[nl + 1..]);
 
@@ -215,10 +236,13 @@ pub fn split_trailing_block_closer(text: &str) -> Option<String> {
         return None;
     }
 
-    let indent: String = last_line
-        .chars()
-        .take_while(|&c| c == ' ' || c == '\t')
-        .collect();
+    let indent: String = match closer_indent {
+        Some(i) => i.to_string(),
+        None => last_line
+            .chars()
+            .take_while(|&c| c == ' ' || c == '\t')
+            .collect(),
+    };
     let eol = if prefix.ends_with("\r\n") {
         "\r\n"
     } else {
@@ -733,9 +757,9 @@ fn is_param_xref(word: &str, param_names: &[&str]) -> bool {
     kdoc_xref_name(word).is_some_and(|name| param_names.contains(&name) && doxy_tag(name).is_none())
 }
 
-/// The parameter name an "@name"/"\\name" cross-reference points at, or "None" if the
-/// word cannot be one. Trailing punctuation is trimmed, since a reference at a
-/// clause break ("@align,") is still a reference.
+/// The parameter name an "@name"/"\\name" cross-reference points at, or "None"
+/// if the word cannot be one. Trailing punctuation is trimmed, since a
+/// reference at a clause break ("@align,") is still a reference.
 ///
 /// Both Doxygen spellings are supported, except one-character C escapes such
 /// as "\\n"; the name must otherwise open like a C identifier, so "\\0"
@@ -1245,21 +1269,35 @@ mod tests {
         // the continuation stars.
         let text = "/* foo\n     * bar. */";
         assert_eq!(
-            split_trailing_block_closer(text).as_deref(),
+            split_trailing_block_closer(text, None).as_deref(),
             Some("/* foo\n     * bar.\n     */")
         );
         // Idempotent: an already-split closer is left alone.
         assert_eq!(
-            split_trailing_block_closer("/* foo\n     * bar.\n     */"),
+            split_trailing_block_closer("/* foo\n     * bar.\n     */", None),
             None
         );
         // Single-line trailing block has no interior line to split.
-        assert_eq!(split_trailing_block_closer("/* foo */"), None);
+        assert_eq!(split_trailing_block_closer("/* foo */", None), None);
         // Empty last line (bare closer with only a marker) stays put.
-        assert_eq!(split_trailing_block_closer("/* foo\n     * */"), None);
+        assert_eq!(split_trailing_block_closer("/* foo\n     * */", None), None);
+        // Whitespace between the last clause and the closer goes with the
+        // closer rather than being left to trail the line.
+        assert_eq!(
+            split_trailing_block_closer("/*@ requires x;\n    assigns y;\t  */", Some(" "))
+                .as_deref(),
+            Some("/*@ requires x;\n    assigns y;\n */")
+        );
+        // Whitespace inside the body is never reached: a string literal that
+        // ends in spaces keeps them.
+        assert_eq!(
+            split_trailing_block_closer("/*@ ghost\n  char *s = \"a   \";   */", Some(" "))
+                .as_deref(),
+            Some("/*@ ghost\n  char *s = \"a   \";\n */")
+        );
         // CRLF endings are preserved.
         assert_eq!(
-            split_trailing_block_closer("/* foo\r\n     * bar. */").as_deref(),
+            split_trailing_block_closer("/* foo\r\n     * bar. */", None).as_deref(),
             Some("/* foo\r\n     * bar.\r\n     */")
         );
     }
@@ -1342,6 +1380,7 @@ mod tests {
         // Escape sequences and names beginning with a digit are not references.
         assert_eq!(kdoc_xref_name("\\n"), None);
         assert_eq!(kdoc_xref_name("\\0"), None);
+
         // Trailing punctuation must not smuggle an escape past the check: a
         // clause ends with "\\n." as readily as it ends with "\\n".
         assert_eq!(kdoc_xref_name("\\n."), None);
@@ -1352,6 +1391,7 @@ mod tests {
         assert_eq!(kdoc_xref_name("@0"), None);
         assert_eq!(kdoc_xref_name("@"), None);
         assert_eq!(kdoc_xref_name("plain"), None);
+
         // A path shape is not a reference even though it opens with a tag
         // keyword: the dot leaves "file.txt" outside the identifier grammar.
         assert_eq!(kdoc_xref_name("@file.txt"), None);

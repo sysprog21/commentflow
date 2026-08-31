@@ -132,6 +132,15 @@ const VOCAB: &[&str] = &[
     "========",
     "---",
     "***",
+    // ACSL clause shapes. The annotation body is passthrough, but its closer
+    // decides between split, veto, and no-op, so the words around it have to be
+    // generatable. A bare "@" is the continuation marker Frama-C reads as
+    // whitespace. "@*/" is deliberately NOT here: a body word spelling a block
+    // closer would terminate every block shape early, so the two closers are
+    // pinned in "shapes" instead.
+    "\\valid(p);",
+    "\\result",
+    "@",
     // Escapes that open with a marker but are ordinary prose.
     "\\0",
     "\\n",
@@ -171,6 +180,17 @@ fn shapes(body: &str) -> Vec<(&'static str, String)> {
         ("foo.rs", format!("fn f() {{}}\n// {body}\n")),
         ("foo.sh", format!("f() {{ :; }}\n# {body}\n")),
         ("foo.S", format!("nop\n/* {body} */\n")),
+        // ACSL, both closer spellings. The glued "*/" is split onto its own
+        // line and must land on a fixed point; the "@*/" form is vetoed and
+        // must come back byte-identical.
+        (
+            "foo.c",
+            format!("/*@ requires x;\n    {body} */\nint f(void);\n"),
+        ),
+        (
+            "foo.c",
+            format!("/*@ requires x;\n  @ {body}\n  @*/\nint f(void);\n"),
+        ),
     ]
 }
 
@@ -233,10 +253,11 @@ fn converged_output_survives_reruns() {
 }
 
 /// The tag rule is allowed to overrun the column limit, but only where it has
-/// no other move. There are exactly two such moves, and both trade width for
+/// no other move. There are exactly two such reasons, and both trade width for
 /// bytes: a run of tags it cannot break in front of, and a rule run it must not
 /// strand on its own line. Any other overlong line is a packing bug, so pin the
-/// two exceptions rather than the absence of one.
+/// two exceptions rather than the absence of one. The rule-run reason has two
+/// spellings, since escaping a two-sided bookend appends a word past the run.
 #[test]
 fn only_a_tag_or_a_rule_may_overflow() {
     let mut rng = Rng(0xBEEF_0003);
@@ -249,9 +270,15 @@ fn only_a_tag_or_a_rule_may_overflow() {
             if line.chars().count() <= width || !line.starts_with("//") {
                 continue;
             }
-            let last = line.split_whitespace().next_back().unwrap_or("");
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let is_rule = |w: &str| w.starts_with(['-', '=', '*']);
+            let last = words.last().copied().unwrap_or("");
             let tag = last.starts_with('@') || last.starts_with('\\');
-            let rule = last.starts_with(['-', '=', '*']);
+            // A rule run can end the line, or sit one word from the end: the
+            // packer escapes a two-sided bookend by appending one more word
+            // AFTER the trailing run, so the line then ends in whatever word
+            // broke it ("--- *** a -------- user@example.com").
+            let rule = is_rule(last) || (words.len() >= 2 && is_rule(words[words.len() - 2]));
             assert!(
                 tag || rule,
                 "case {case} w={width} line over the limit ends in neither a tag nor a rule: {line:?}\n--- src\n{src}--- out\n{out}"

@@ -611,25 +611,81 @@ fn wrap_segment_aligned(
             .unwrap_or(&out[last])
             .to_string();
 
-        // The borrowed word opens the paragraph's last line, and that line is
+        // The borrowed text opens the paragraph's last line, and that line is
         // always a continuation, so the tag rule above applies to it just as it
         // does to a mid-paragraph break: a tag parked at the first column is
         // read by "classify_lines" as its own tag paragraph, the next pass
         // regroups around it, and the hanging indent moves with the regrouping.
         //
-        // When there is nothing to borrow, or borrowing would build one of the
+        // Every split point is tried, longest prefix first, so the borrow can
+        // take two words or more. Borrowing exactly one is not enough on a line
+        // that carries rule runs, and that is the line this arm sees most: the
+        // one word above the rule is often a tag, which may not open a line,
+        // while the prefix left behind by taking it is often a bare rule, which
+        // may not stand alone. Both fire at once on "-------- \result @1buf:",
+        // where the only safe cut is two words up. Taking the single-word split
+        // as the whole search emitted the rule alone, and the next pass read
+        // that as a bare rule and deleted it, losing a word.
+        //
+        // When nothing can be borrowed, or every borrow builds one of the
         // shapes above, fold the rule onto the line above whole. That arm used
         // to sit inside the "there is a word to borrow" case, so a line holding
         // ONE word (no space to split at) fell through and emitted the rule
-        // alone anyway, which the next pass reads as a bare rule and deletes.
-        let borrow = prev_body.rfind(' ').filter(|&space| {
-            let borrowed = &prev_body[space + 1..];
-            !is_tag_start(borrowed)
-                && bookend_match(&prev_body[..space]).is_none()
-                && bookend_match(&format!("{borrowed} {current}")).is_none()
-        });
-        if let Some(space) = borrow {
-            out[last] = format!("{prev_prefix}{}", &prev_body[..space]);
+        // alone anyway.
+        let opens_with_tag = |seg: &str| {
+            // "is_tag_start" reads one word; "is_kernel_doc_tag" reads a line
+            // start, so it also catches the spaced "@name : desc" form, whose
+            // first word alone ("@name") is not a tag.
+            is_tag_start(seg.split_whitespace().next().unwrap_or("")) || is_kernel_doc_tag(seg)
+        };
+
+        // A split is usable when the text moved down may open a line and
+        // neither resulting line is a bookend. The prefix left behind gets one
+        // extra chance: a bare rule there may be folded onto the line above it,
+        // which is how the rule-led case resolves. "-------- \result @1buf:"
+        // has no usable split on its own, since the only cut that frees a
+        // non-tag opener strands "--------"; folding that run one line further
+        // up yields "@param.txt @1buf --------" over "\result @1buf: ***", two
+        // lines the next pass rewrites neither of.
+        let above = |i: usize| {
+            let p = if i == first_line_mark {
+                prefix
+            } else {
+                cont_prefix
+            };
+            (p, out[i].strip_prefix(p).unwrap_or(&out[i]).to_string())
+        };
+        let usable = prev_body
+            .match_indices(' ')
+            .map(|(space, _)| space)
+            .rev()
+            .find_map(|space| {
+                let borrowed = &prev_body[space + 1..];
+                if opens_with_tag(borrowed)
+                    || bookend_match(&format!("{borrowed} {current}")).is_some()
+                {
+                    return None;
+                }
+                let head = &prev_body[..space];
+                if bookend_match(head).is_none() {
+                    return Some((space, false));
+                }
+                if last <= first_line_mark {
+                    return None;
+                }
+                let (_, above_body) = above(last - 1);
+                bookend_match(&format!("{above_body} {head}"))
+                    .is_none()
+                    .then_some((space, true))
+            });
+        if let Some((space, fold_head)) = usable {
+            if fold_head {
+                let (above_prefix, above_body) = above(last - 1);
+                out[last - 1] = format!("{above_prefix}{above_body} {}", &prev_body[..space]);
+                out.remove(last);
+            } else {
+                out[last] = format!("{prev_prefix}{}", &prev_body[..space]);
+            }
             current = format!("{} {current}", &prev_body[space + 1..]);
         } else if bookend_match(&format!("{prev_body} {current}")).is_none() {
             out[last] = format!("{prev_prefix}{prev_body} {current}");
