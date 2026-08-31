@@ -200,6 +200,30 @@ fn pipeline_keeps_glued_acsl_closer_when_another_rail_applies() {
 }
 
 #[test]
+fn paragraph_end_rule_borrows_across_a_stranded_run() {
+    // The paragraph's last word is a rule run, and the line above is rule-led,
+    // so the single-word borrow has no legal cut: taking "@1buf:" parks a
+    // kernel-doc tag at a line start, and the "--------" it leaves behind is a
+    // bare rule the next pass deletes. The borrow reaches two words up and
+    // folds the stranded run onto the line above it instead. "common::pipeline"
+    // asserts the second pass is a no-op, which is what used to fail here.
+    let src = "/* lead one\n *\n * @return: @return/x @param. reallyquitelongword @1buf @param: @return: @note/path gamma @2: @param.txt @1buf -------- \\result @1buf: ***\n */\n";
+    let out = pipeline(src, detect("foo.c"), 27);
+    assert!(
+        out.contains("@param.txt @1buf --------"),
+        "the stranded rule folds onto the line above: {out}"
+    );
+    assert!(
+        out.contains("\\result @1buf: ***"),
+        "and the rule run keeps company on the last line: {out}"
+    );
+    assert!(
+        !out.lines().any(|l| l.trim() == "* ***"),
+        "no line is left as a bare rule for the next pass to delete: {out}"
+    );
+}
+
+#[test]
 fn block_opener_alone_preserved() {
     // Source uses opener-alone form. Output must keep it that way.
     let src = "/*\n * This is a multi-line block comment that should reflow but the opener-alone\n * form must be preserved because that is what the source uses.\n */\nint main(void) { return 0; }\n";
