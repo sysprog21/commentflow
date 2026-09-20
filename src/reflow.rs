@@ -197,9 +197,17 @@ fn emit_paragraphs(
                     // decorative bookend land like every reflowed sibling. The
                     // body itself still goes out verbatim, unwrapped. Metadata
                     // keeps raw replay: a license block is not ours to retouch.
-                    if matches!(doc.lines[li].kind, LineKind::LabelRow | LineKind::Banner)
-                        && !(skip_first_emit_inline_opener && li == 0)
-                    {
+                    //
+                    // This holds for line 0 of an inline-opener block too. The
+                    // raw-replay branch below would hand back the pre-strip
+                    // bytes, undoing "strip_decorative_bookends" for that one
+                    // line while its siblings keep the strip -- and the next
+                    // pass, seeing the bookend on a line that is no longer
+                    // first, would strip it after all. That is a divergence,
+                    // and "--check" would report a diff forever. "text" is
+                    // already the stripped body with the opener removed, which
+                    // is exactly what that branch reconstructs by hand.
+                    if matches!(doc.lines[li].kind, LineKind::LabelRow | LineKind::Banner) {
                         out.push(
                             format!("{prefix}{}", doc.lines[li].text)
                                 .trim_end()

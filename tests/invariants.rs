@@ -652,6 +652,21 @@ fn markdown_list_boundary_numbered_list_not_collapsed() {
 // preformatted_borderline
 
 #[test]
+fn preformatted_label_row_on_an_inline_opener_keeps_its_strip() {
+    // Line 0 of a "/* <content>" block took the raw-replay branch, which
+    // rebuilds the line from bytes predating "strip_decorative_bookends". Its
+    // siblings kept the strip, so pass 1 emitted a mixed result and pass 2
+    // finished the job: "--check" would report a diff forever.
+    let src = "/* ==== Foo: the first value ====\n * ==== Bar: the second value ====\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(
+        out, "/*\n * Foo: the first value\n * Bar: the second value\n */\nint f(void);\n",
+        "the opener's line must be stripped like its siblings, got:\n{out}"
+    );
+    assert_eq!(pipeline(&out, detect("foo.c"), 60), out, "must converge");
+}
+
+#[test]
 fn preformatted_borderline_operator_prose_reflows() {
     // "when a > b && c < d, return early" must reflow normally; it is not ASCII
     // art (the word-length guard fires on "when", "early", "return").
