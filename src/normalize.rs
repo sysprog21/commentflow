@@ -1172,9 +1172,9 @@ fn group_paragraphs(lines: &[Line]) -> Vec<Paragraph> {
                 blank_pending = false;
                 i += 1;
             }
-            kind if is_preformatted_kind(kind) => {
+            kind if kind.is_preformatted() => {
                 let start = i;
-                while i < lines.len() && is_preformatted_kind(lines[i].kind) {
+                while i < lines.len() && lines[i].kind.is_preformatted() {
                     i += 1;
                 }
                 paragraphs.push(Paragraph {
@@ -1184,10 +1184,11 @@ fn group_paragraphs(lines: &[Line]) -> Vec<Paragraph> {
                 });
                 blank_pending = false;
             }
-            LineKind::Prose
-            | LineKind::DoxygenTag
-            | LineKind::ListItem
-            | LineKind::SetextUnderline => {
+            // Everything "is_preformatted" answered no to, which the guard
+            // above has already taken the yes-cases from. A catch-all rather
+            // than a list, so a new variant lands where its own answer says it
+            // belongs instead of being frozen by a trailing wildcard.
+            _ => {
                 let start = i;
                 i += 1;
                 while i < lines.len()
@@ -1203,38 +1204,9 @@ fn group_paragraphs(lines: &[Line]) -> Vec<Paragraph> {
                 });
                 blank_pending = false;
             }
-            _ => {
-                paragraphs.push(Paragraph {
-                    kind: ParagraphKind::Preformatted,
-                    line_indices: vec![i],
-                    preceded_by_blank: blank_pending,
-                });
-                blank_pending = false;
-                i += 1;
-            }
         }
     }
     paragraphs
-}
-
-fn is_preformatted_kind(k: LineKind) -> bool {
-    matches!(
-        k,
-        LineKind::FenceOpen
-            | LineKind::FenceContent
-            | LineKind::FenceClose
-            | LineKind::DoxyVerbatimOpen
-            | LineKind::DoxyVerbatimContent
-            | LineKind::DoxyVerbatimClose
-            | LineKind::IndentedCode
-            | LineKind::TableRow
-            | LineKind::Blockquote
-            | LineKind::ReferenceLink
-            | LineKind::Metadata
-            | LineKind::LabelRow
-            | LineKind::Banner
-            | LineKind::Art
-    )
 }
 
 fn starts_new_prose_paragraph(l: &Line) -> bool {

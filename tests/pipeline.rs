@@ -327,6 +327,37 @@ fn adjacent_block_comments_skip_table_merge() {
 }
 
 #[test]
+fn adjacent_block_comments_skip_bookended_assignment_run_merge() {
+    // "strip_decorative_bookends" runs between the merge stage and the
+    // classifier, so the merge gate has to read through the decoration: the
+    // classifier will see "base = 0x40" where the raw line says
+    // "==== base = 0x40 ====", and answering on the raw line let this prose
+    // comment merge into a table that then froze around it.
+    let src = "/*\n * ==== base = 0x40 ====\n * ==== limit = 0x80 ====\n */\n/* more words */\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert!(
+        out.contains("/* more words */"),
+        "prose must stay its own comment, got:\n{out}"
+    );
+    // The decoration strip happens on pass one, so pass two must agree.
+    assert_eq!(
+        pipeline(&out, detect("foo.c"), 80),
+        out,
+        "must converge, got:\n{out}"
+    );
+}
+
+#[test]
+fn adjacent_block_comments_skip_assignment_run_merge() {
+    // A mapping table is preformatted at the classify stage, so merging the
+    // next comment into it would pull unrelated prose inside the frozen block.
+    let src =
+        "/*\n * ir->imm = lui immediate\n * ir->imm2 = addi immediate\n */\n/* more words */\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(out, src, "assignment block must not be merged, got:\n{out}");
+}
+
+#[test]
 fn adjacent_block_comments_skip_fence_merge() {
     let src = "/*\n * ```\n * code();\n * ```\n */\n/* more words */\n";
     let out = pipeline(src, detect("foo.c"), 80);

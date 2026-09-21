@@ -125,6 +125,15 @@ const VOCAB: &[&str] = &[
     "\\param.h",
     "@see.com",
     "user@example.com",
+    // Assignment operators, which "textline::is_assignment_line" keys on.
+    // Without these no token in this vocabulary can spell a mapping row, so
+    // the packer could never forge one at a line start and the run rule in
+    // "linekind" would be unreachable from this sweep. "==" is here to be
+    // rejected: it is the comparison the row rule must not claim.
+    "=",
+    "==",
+    "+=",
+    "x=1",
     // Rule runs, which the bookend and one-sided-banner rules key on. A run
     // that lands alone in a paragraph is decoration and freezes; one inside a
     // paragraph is an em-dash and must keep reflowing.

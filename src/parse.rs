@@ -5,7 +5,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::signature::{collect_param_shifts, manpage_relocate_target};
 use crate::textline::{
-    block_is_doc, fence_marker_run, is_art, is_horizontal_rule, is_indented_code, is_table_row,
+    BookendKind, block_is_doc, bookend_match, fence_marker_run, is_art, is_assignment_line,
+    is_horizontal_rule, is_indented_code, is_table_row,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,10 +548,37 @@ fn block_body_lines(text: &str) -> Vec<String> {
 }
 
 fn block_merge_has_preformatted(c: &Comment) -> bool {
-    marker_kind(&c.text) == Some(MarkerKind::PlainBlock)
-        && block_body_lines(&c.text)
-            .iter()
-            .any(|line| block_line_is_preformatted(line))
+    if marker_kind(&c.text) != Some(MarkerKind::PlainBlock) {
+        return false;
+    }
+    let body = block_body_lines(&c.text);
+    body.iter().any(|line| block_line_is_preformatted(line)) || has_assignment_run(&body)
+}
+
+/// The merge-stage twin of the classifier's assignment-row rule. A mapping
+/// table is preformatted at the classify stage, so merging a neighboring
+/// comment into it would pull unrelated prose inside the frozen block.
+///
+/// This has to answer exactly what the classifier would answer for this
+/// comment standing alone, in both directions. Under-blocking merges a comment
+/// into a frozen table; over-blocking refuses a merge the classifier would
+/// have been happy with, leaving two comments where one belongs. Sharing
+/// Sharing "is_assignment_line" is what keeps the two answers identical, over
+/// the same
+/// two-adjacent-rows threshold the classifier uses; a lone row is a sentence
+/// there too, and must not block a merge.
+fn has_assignment_run(body: &[String]) -> bool {
+    // Through the bookend, because "strip_decorative_bookends" runs between
+    // this stage and the classifier: the classifier will see "base = 0x40"
+    // where this sees "==== base = 0x40 ====", and answering on the raw line
+    // lets a prose comment merge into a table that then freezes around it. A
+    // maximal run of two or more exists exactly when some adjacent pair both
+    // qualify, so the gate needs no run marking of its own.
+    let row = |l: &String| match bookend_match(l) {
+        Some(BookendKind::Labeled(label)) => is_assignment_line(&label),
+        _ => is_assignment_line(l),
+    };
+    body.windows(2).any(|w| row(&w[0]) && row(&w[1]))
 }
 
 fn block_line_is_preformatted(line: &str) -> bool {
