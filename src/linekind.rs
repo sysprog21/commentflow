@@ -10,8 +10,9 @@
 
 use crate::classify::DocFlavor;
 use crate::textline::{
-    FAST_PATH_TAB_WIDTH, advance_col, bookend_match, fence_marker_run, is_art, is_indented_code,
-    is_kernel_doc_tag, is_table_row, line_is_art_only, one_sided_banner,
+    FAST_PATH_TAB_WIDTH, advance_col, bookend_match, fence_marker_run, is_art, is_assignment_line,
+    is_indented_code, is_kernel_doc_tag, is_table_row, keep_complete_row_runs, line_is_art_only,
+    one_sided_banner,
 };
 
 /// One comment source line with its marker prefix split off: "prefix" is what
@@ -36,6 +37,12 @@ pub enum LineKind {
     DoxyVerbatimClose,
     IndentedCode,
     TableRow,
+    /// A compact assignment or formula row (for example, "ir->imm = value").
+    /// These rows document a mapping, not a sentence, so preserve their
+    /// one-row layout instead of merging them into adjacent prose. Only a run
+    /// of two or more adjacent rows qualifies, and the run freezes whole; see
+    /// "textline::keep_complete_row_runs".
+    AssignmentForm,
     Blockquote,
     ReferenceLink,
     SetextUnderline,
@@ -58,6 +65,67 @@ pub enum LineKind {
     /// so a reader chasing "Key: value" behavior is not sent to a dash rule.
     /// See "textline::one_sided_banner".
     Banner,
+}
+
+impl LineKind {
+    /// Does this kind go out verbatim instead of being packed into a prose
+    /// paragraph? "normalize::group_paragraphs" keys paragraph boundaries on
+    /// this, so a kind that answers wrong is reflowed as prose.
+    ///
+    /// Exhaustive on purpose: a new variant must answer this question before
+    /// it compiles, rather than defaulting to "reflow it" and being found by
+    /// a corrupted diagram later.
+    pub(crate) fn is_preformatted(self) -> bool {
+        match self {
+            LineKind::FenceOpen
+            | LineKind::FenceContent
+            | LineKind::FenceClose
+            | LineKind::DoxyVerbatimOpen
+            | LineKind::DoxyVerbatimContent
+            | LineKind::DoxyVerbatimClose
+            | LineKind::IndentedCode
+            | LineKind::TableRow
+            | LineKind::AssignmentForm
+            | LineKind::Blockquote
+            | LineKind::ReferenceLink
+            | LineKind::Metadata
+            | LineKind::LabelRow
+            | LineKind::Banner
+            | LineKind::Art => true,
+            LineKind::Blank
+            | LineKind::Prose
+            | LineKind::SetextUnderline
+            | LineKind::AtxHeader
+            | LineKind::ListItem
+            | LineKind::DoxygenTag => false,
+        }
+    }
+
+    /// The kinds that re-emit their body behind the canonical prefix instead
+    /// of replaying their raw source line: rows whose bytes are ordinary text,
+    /// not layout, so a drifted "**" marker and a stripped decorative bookend
+    /// land like every reflowed sibling. Raw replay is for the kinds whose
+    /// exact source bytes are the content (art, code, tables) and for
+    /// metadata, which is not ours to retouch.
+    ///
+    /// Named once so "emits_canonically" and the invariant test that it
+    /// implies "is_preformatted" cannot drift apart.
+    #[cfg(test)]
+    pub(crate) const CANONICAL: [LineKind; 3] = [
+        LineKind::LabelRow,
+        LineKind::Banner,
+        LineKind::AssignmentForm,
+    ];
+
+    /// See "CANONICAL". Unlike "is_preformatted" this is not exhaustive: the
+    /// safe default is raw replay, and a new variant is already forced into
+    /// this impl block by the exhaustive match above.
+    pub(crate) fn emits_canonically(self) -> bool {
+        matches!(
+            self,
+            LineKind::LabelRow | LineKind::Banner | LineKind::AssignmentForm
+        )
+    }
 }
 
 /// What a Doxygen tag does to the line that carries it.
@@ -172,20 +240,27 @@ enum DoxyState {
 ///   7. ATX header, then metadata (license/SPDX).
 ///   8. Blockquote, reference link, table row, indented code. All preformatted.
 ///   9. Label runs. Deliberately AFTER indented code: a "Key: value" line with a
-///      code sample's indentation belongs to the sample. See "is_label_run".
+///      code sample's indentation belongs to the sample. See "label_runs".
 ///  10. One-sided banners ("label -------"), which freeze only when they stand
 ///      alone in a paragraph. See "textline::one_sided_banner".
 ///  11. Art, list item, and finally prose as the fallback.
 ///
+/// Mapping runs are not in that order at all: they are decided after the loop,
+/// over the lines nothing else claimed, so a run cannot reach through a code
+/// sample or a table. See "mark_assignment_runs".
+///
 /// A check that yields a preformatted kind can be reordered against other
-/// preformatted checks without changing output (they all emit the same way);
-/// anything else needs the reasoning above rechecked.
+/// preformatted checks that share its emit path without changing output; the
+/// two paths are "LineKind::emits_canonically". Reordering across that
+/// boundary, or moving any non-preformatted check, needs the reasoning above
+/// rechecked.
 pub(crate) fn classify_lines(
     lines: &[StrippedLine],
     flavor: DocFlavor,
     label_budget: usize,
 ) -> Vec<LineKind> {
     let mut out = vec![LineKind::Prose; lines.len()];
+    let in_label_run = label_runs(lines, label_budget);
     let mut fence = FenceState::Closed;
     let mut doxy = DoxyState::Closed;
 
@@ -310,7 +385,7 @@ pub(crate) fn classify_lines(
         // After IndentedCode: a banner may pad one space past the marker for
         // alignment, which is below the indented-code threshold. A deeper
         // indent belongs to a code sample and is already claimed above.
-        if is_label_run(lines, i, label_budget) {
+        if in_label_run[i] {
             out[i] = LineKind::LabelRow;
             continue;
         }
@@ -339,7 +414,46 @@ pub(crate) fn classify_lines(
 
         out[i] = LineKind::Prose;
     }
+    mark_assignment_runs(lines, &mut out);
+
     out
+}
+
+/// Mapping runs, decided after every other check rather than inside the loop.
+///
+/// A row's neighbour has to be a row in the OUTPUT, not merely row-shaped in
+/// the source. An indented code sample reads as a row once trimmed, so judging
+/// on shape alone let "  ret = foo(a, b);" pair with the sentence under it and
+/// freeze that sentence on its own -- the lone-row case the run rule exists to
+/// reflow. Only lines nothing else claimed are eligible, so the run cannot
+/// reach through a code sample, a table row, a blockquote, or a fence.
+///
+/// Running last costs nothing against the kinds that would have come after it.
+/// A label row and a mapping row are emitted the same way, so which one claims
+/// a line that could be either does not change the output; art already declines
+/// a mapping row; and a list item or a lone banner is never row-shaped.
+///
+/// No width budget here, unlike a label run: a mapping row cannot be wrapped
+/// without destroying the mapping, so a frozen run may overflow the column
+/// limit exactly as a table row or an indented code sample may. See
+/// "preformatted_assignment_run_may_overflow_by_design".
+fn mark_assignment_runs(lines: &[StrippedLine], out: &mut [LineKind]) {
+    // Most comments carry no "=" at all, and skipping them keeps the common
+    // case free of the vector below.
+    if !lines.iter().any(|l| l.body.as_bytes().contains(&b'=')) {
+        return;
+    }
+    let mut rows: Vec<bool> = out
+        .iter()
+        .zip(lines)
+        .map(|(kind, l)| *kind == LineKind::Prose && is_assignment_line(&l.body))
+        .collect();
+    keep_complete_row_runs(&mut rows);
+    for (i, in_run) in rows.into_iter().enumerate() {
+        if in_run {
+            out[i] = LineKind::AssignmentForm;
+        }
+    }
 }
 
 // Classify-pass twin of the strip pass's "is_protective" adjacency check (see
@@ -456,29 +570,32 @@ fn is_metadata_line(body: &str) -> bool {
 }
 
 /// "Key: value" banner lines, the "File:" / "Task:" shape of a file header,
-/// keep their own line instead of packing into one paragraph. Only a run of two
-/// or more adjacent ones counts: a lone "Note: ..." starting a prose paragraph
-/// is a sentence, and wrapping it is correct.
-fn is_label_run(lines: &[StrippedLine], i: usize, budget: usize) -> bool {
-    let eligible = |j: usize| label_eligible(lines, j, budget);
-    eligible(i) && (i.checked_sub(1).is_some_and(eligible) || eligible(i + 1))
-}
+/// keep their own line instead of packing into one paragraph, on the shared
+/// row-run rule. A label that does not already fit the budget is not a row:
+/// unlike a mapping row it is a wrappable sentence, so freezing it would park
+/// it over the column limit forever.
+fn label_runs(lines: &[StrippedLine], budget: usize) -> Vec<bool> {
+    let label: Vec<bool> = lines
+        .iter()
+        .map(|l| is_label_line(&l.body, budget))
+        .collect();
 
-/// A label line joins a run only when the line below it ends the run cleanly:
-/// blank, gone, or another label. A label followed by ordinary prose is the
-/// head of a badly wrapped paragraph, and freezing it strands the tail on its
-/// own, which is the exact damage this tool exists to repair.
-fn label_eligible(lines: &[StrippedLine], i: usize, budget: usize) -> bool {
-    let Some(l) = lines.get(i) else {
-        return false;
-    };
-    if !is_label_line(&l.body, budget) {
-        return false;
-    }
-    match lines.get(i + 1) {
-        None => true,
-        Some(next) => next.body.trim().is_empty() || is_label_line(&next.body, budget),
-    }
+    // A label joins a run only when the line below ends the run cleanly: blank,
+    // gone, or another label. A label followed by ordinary prose is the head of
+    // a badly wrapped paragraph, and freezing it strands the tail. A mapping
+    // row deliberately forgoes this: its value is code, not a clause, so it
+    // does not wrap into the line below. That conjunct is the whole difference
+    // between the two rules; the run arithmetic is shared.
+    let mut eligible: Vec<bool> = (0..lines.len())
+        .map(|j| {
+            label[j]
+                && lines
+                    .get(j + 1)
+                    .is_none_or(|next| next.body.trim().is_empty() || label[j + 1])
+        })
+        .collect();
+    keep_complete_row_runs(&mut eligible);
+    eligible
 }
 
 fn is_label_line(body: &str, budget: usize) -> bool {
@@ -707,6 +824,129 @@ mod tests {
     }
 
     #[test]
+    fn canonical_emit_implies_preformatted() {
+        // Raw replay is the fallback in "reflow::emit_paragraphs", reached only
+        // inside a preformatted paragraph. A kind that emits canonically but is
+        // not preformatted would never reach either branch.
+        for k in LineKind::CANONICAL {
+            assert!(k.emits_canonically(), "{k:?} is missing from the matches!");
+            assert!(
+                k.is_preformatted(),
+                "{k:?} emits canonically but is not preformatted"
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_runs_are_preformatted() {
+        use LineKind::AssignmentForm as A;
+
+        // A run of two or more rows freezes; every spelling of the operator and
+        // any alignment padding counts as the same row shape.
+        assert_eq!(kinds(&["X = Y", "Z = W"], DocFlavor::None), vec![A, A]);
+        assert_eq!(
+            kinds(
+                &[
+                    "ir->imm   = immediate",
+                    "ir->imm2  = offset",
+                    "ir->rd = dest"
+                ],
+                DocFlavor::None
+            ),
+            vec![A, A, A]
+        );
+        assert_eq!(
+            kinds(&["a=b", "c += 1", "flags |= MASK"], DocFlavor::None),
+            vec![A, A, A]
+        );
+        assert_eq!(
+            kinds(&["Foo::bar = x", "f(x) = y", "%eax = 0"], DocFlavor::None),
+            vec![A, A, A]
+        );
+    }
+
+    #[test]
+    fn a_lone_assignment_row_is_prose() {
+        use LineKind::Prose as P;
+
+        // One row is a sentence: "count = zero ..." must reflow with the
+        // paragraph it belongs to, not freeze and strand the tail.
+        assert_eq!(classify_one("X = Y", DocFlavor::None), LineKind::Prose);
+        assert_eq!(
+            kinds(
+                &[
+                    "The mapping is fixed by the header:",
+                    "offset = base plus the length of the header, rounded up to",
+                    "the next multiple of the alignment the caller requested.",
+                ],
+                DocFlavor::None
+            ),
+            vec![P, P, P]
+        );
+        // A row whose successor is prose heads a badly wrapped paragraph.
+        assert_eq!(
+            kinds(
+                &["a = 1", "and then we continue the sentence"],
+                DocFlavor::None
+            ),
+            vec![P, P]
+        );
+    }
+
+    #[test]
+    fn arrow_spellings_are_not_assignments() {
+        // "=>" is an arrow and "=<" is nothing at all. Neither opens a mapping
+        // row, however many of them sit together.
+        for op in ["=>", "=<"] {
+            let k = kinds(
+                &[&format!("a {op} 1"), &format!("b {op} 2")],
+                DocFlavor::None,
+            );
+            assert!(
+                !k.contains(&LineKind::AssignmentForm),
+                "{op} must not classify as a mapping row, got {k:?}"
+            );
+        }
+        // Tested unspaced, so a real value opening with "<" still qualifies.
+        assert_eq!(
+            kinds(&["first = <unknown>", "second = <unset>"], DocFlavor::None),
+            vec![LineKind::AssignmentForm; 2]
+        );
+    }
+
+    #[test]
+    fn comparisons_are_not_assignments() {
+        assert_eq!(
+            kinds(
+                &["when a == b, continue", "and c === d too"],
+                DocFlavor::None
+            ),
+            vec![LineKind::Prose, LineKind::Prose]
+        );
+
+        // "!=", "<=", ">=" never assign. (A bare "c <= d" is short and dense
+        // enough that the art rule claims it first; what matters here is only
+        // that the assignment rule does not.)
+        assert!(
+            !kinds(&["a != b", "c <= d", "e >= f"], DocFlavor::None)
+                .contains(&LineKind::AssignmentForm)
+        );
+        // Multi-token left-hand sides are prose, however they are spelled.
+        assert_eq!(
+            kinds(
+                &["the value = means enabled", "the other = means disabled"],
+                DocFlavor::None
+            ),
+            vec![LineKind::Prose, LineKind::Prose]
+        );
+        // "<<=" and ">>=" do assign, unlike "<=" and ">=".
+        assert_eq!(
+            kinds(&["mask <<= 1", "other >>= 2"], DocFlavor::None),
+            vec![LineKind::AssignmentForm, LineKind::AssignmentForm]
+        );
+    }
+
+    #[test]
     fn doxygen_tag_recognized() {
         assert_eq!(
             classify_one("@param x foo", DocFlavor::Doxygen),
@@ -812,8 +1052,19 @@ mod tests {
             LineKind::Metadata
         );
 
-        // 9. Label runs come AFTER indented code, so a "Key: value" line with a
-        //    code sample's indentation belongs to the sample.
+        // 9. Assignment runs come after indented code too: an aligned mapping
+        //    row carrying a code sample's indentation belongs to the sample.
+        assert_eq!(
+            kinds(&["  a = 1", "  b = 2"], DocFlavor::None),
+            [LineKind::IndentedCode, LineKind::IndentedCode]
+        );
+        assert_eq!(
+            kinds(&["a = 1", "b = 2"], DocFlavor::None),
+            [LineKind::AssignmentForm, LineKind::AssignmentForm]
+        );
+
+        // 10. Label runs come AFTER indented code, so a "Key: value" line with
+        //    a code sample's indentation belongs to the sample.
         assert_eq!(
             kinds(&["  File: x.c", "  Task: y"], DocFlavor::None),
             [LineKind::IndentedCode, LineKind::IndentedCode]
@@ -823,7 +1074,7 @@ mod tests {
             [LineKind::LabelRow, LineKind::LabelRow]
         );
 
-        // 10. Art, list item, then prose as the fallback.
+        // 12. Art, list item, then prose as the fallback.
         assert_eq!(kinds(&["- one"], DocFlavor::None)[0], LineKind::ListItem);
         assert_eq!(
             kinds(&["ordinary sentence"], DocFlavor::None)[0],

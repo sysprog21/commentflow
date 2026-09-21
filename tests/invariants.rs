@@ -652,6 +652,157 @@ fn markdown_list_boundary_numbered_list_not_collapsed() {
 // preformatted_borderline
 
 #[test]
+fn preformatted_assignment_row_spellings_pass_through() {
+    // The classifier pins these shapes in "assignment_runs_are_preformatted";
+    // what the pipeline adds is that a classified run is emitted byte for byte,
+    // including the alignment padding that is part of the layout.
+    for src in [
+        "/*\n * ir->imm   = immediate\n * ir->imm2  = offset\n * ir->rd    = dest\n */\nint f(void) { return 0; }\n",
+        "/*\n * ir->imm=lui immediate\n * ir->imm2=addi immediate\n * ir->rd=destination register\n */\nint f(void) { return 0; }\n",
+        "/*\n * total += delta\n * count -= 1\n * flags |= MASK\n */\nint g(void) { return 0; }\n",
+    ] {
+        let out = pipeline(src, detect("foo.c"), 60);
+        assert_eq!(out, src, "mapping rows must survive verbatim, got:\n{out}");
+    }
+}
+
+#[test]
+fn preformatted_assignment_run_survives_a_prose_tail() {
+    // The run freezes whole or not at all. Releasing only its last row to a
+    // following sentence would split one logical table, and a table sitting
+    // directly above its explanation, with no blank line, is the common shape.
+    let src = "/*\n * ir->imm = lui immediate\n * ir->imm2 = addi immediate\n * ir->rd = destination register\n * The immediate is already shifted left by twelve.\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert!(
+        out.contains(" * ir->imm = lui immediate\n * ir->imm2 = addi immediate\n * ir->rd = destination register\n"),
+        "the whole run must survive its prose tail, got:\n{out}"
+    );
+    assert!(
+        out.contains(" * The immediate is already shifted left by twelve.\n"),
+        "the tail must reflow as its own paragraph, got:\n{out}"
+    );
+}
+
+#[test]
+fn preformatted_assignment_run_does_not_reach_through_a_code_sample() {
+    // An indented code sample reads as a row once trimmed, so judging on shape
+    // alone paired it with the sentence below and froze that sentence on its
+    // own. A row's neighbour has to be a row in the output, not in the source.
+    let src = "/*\n *   x = 1\n * count = zero when the queue drained, and\n * any drift between the two numbers means a leak.\n */\nint a(void);\n";
+    let out = pipeline(src, detect("foo.c"), 72);
+    assert!(
+        out.contains(" *   x = 1\n"),
+        "the sample must stay put, got:\n{out}"
+    );
+    assert!(
+        out.contains("count = zero when the queue drained, and any drift"),
+        "the lone row must rejoin its paragraph, got:\n{out}"
+    );
+}
+
+#[test]
+fn preformatted_rule_decorated_row_stays_art() {
+    // Released to prose, the packer joins "x += y ---" to the "--- Mapping"
+    // above it and builds a line ruled on both ends, which the next pass
+    // strips: different bytes every pass, and "--check" never settles.
+    let src = "/*\n * --- Mapping\n * x += y ---\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        out, src,
+        "decoration outranks the mapping reading, got:\n{out}"
+    );
+    assert_eq!(pipeline(&out, detect("foo.c"), 80), out, "must converge");
+}
+
+#[test]
+fn preformatted_bracketed_value_is_still_a_mapping_row() {
+    // The arrow rejection is tested unspaced, so a genuine value that opens
+    // with "<" keeps reading as one. (The "=>" / "=<" rejection itself is
+    // pinned at classification level in
+    // "linekind::arrow_spellings_are_not_assignments".)
+    let src = "/*\n * first = <unknown>\n * second = <unset>\n */\nint f(void);\n";
+    assert_eq!(pipeline(src, detect("foo.c"), 80), src);
+}
+
+#[test]
+fn preformatted_lone_assignment_row_reflows_with_its_paragraph() {
+    // One row is a sentence, not a mapping: freezing it would strand the tail
+    // of the sentence and pin the source's accidental line breaks forever.
+    let src = "/*\n * The invariant the allocator maintains is simple enough: the\n * count = zero exactly when the queue has been drained, and any\n * drift between the two numbers means a leak somewhere.\n */\nint a(void);\n";
+    let out = pipeline(src, detect("foo.c"), 72);
+    assert!(
+        out.contains("simple enough: the count =\n"),
+        "a lone assignment-shaped line must refill with its paragraph, got:\n{out}"
+    );
+}
+
+#[test]
+fn preformatted_lone_assignment_row_over_the_limit_still_wraps() {
+    // A frozen row is emitted as-is, so a lone over-long one would park over
+    // the column limit forever. Only a run of rows is unwrappable layout.
+    let src = "/* timeout = the number of milliseconds the poller waits before it gives up and returns an error */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert!(
+        out.lines().all(|l| l.chars().count() <= 80),
+        "a lone assignment-shaped sentence must wrap, got:\n{out}"
+    );
+}
+
+#[test]
+fn preformatted_lone_assignment_row_is_not_claimed_by_art() {
+    // "=" is a member of the art alphabet, so a short row like "a += b" clears
+    // the density threshold on the very characters that make it a row. Art used
+    // to claim it after the run rule had declined to freeze it, which stranded
+    // the paragraph tail the run rule exists to protect.
+    let src = "/*\n * a += b\n * and then the sentence continues here with more words than fit\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 40);
+    assert!(
+        out.contains(" * a += b and then the sentence\n"),
+        "a lone row must rejoin its paragraph, got:\n{out}"
+    );
+
+    // The run rule still owns the other half of the decision.
+    let run = "/*\n * a += b\n * c -= d\n * e |= f\n */\nint g(void);\n";
+    assert_eq!(
+        pipeline(run, detect("foo.c"), 40),
+        run,
+        "a run must still freeze"
+    );
+
+    // And a real drawing is untouched: "|a" is not a single code-like token.
+    let art = "/*\n * +-----+\n * |a = b|\n * +-----+\n */\nint h(void);\n";
+    let out = pipeline(art, detect("foo.c"), 40);
+    assert!(
+        out.contains(" * |a = b|\n"),
+        "art must survive, got:\n{out}"
+    );
+}
+
+#[test]
+fn preformatted_assignment_run_may_overflow_by_design() {
+    // The boundary of the no-width-budget trade, pinned so it is not mistaken
+    // for a packing bug: a LONE over-long row reflows (see the test above), but
+    // a run of them freezes and stays over the limit, exactly as a table row or
+    // an indented code sample does.
+    let src = "/*\n * timeout = the number of milliseconds the poller waits before it gives up\n * retries = the number of attempts that are made before the caller sees an error\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(out, src, "a frozen run must stay verbatim, got:\n{out}");
+    assert!(out.lines().any(|l| l.chars().count() > 60));
+}
+
+#[test]
+fn preformatted_assignment_rows_keep_the_bookend_strip() {
+    // The rows replay behind the canonical prefix, like a label or banner row,
+    // so the decorative bookend the strip pass removed stays removed.
+    let src = "/*\n * ==== base = 0x40 ====\n * ==== top  = 0x80 ====\n */\nint g(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(
+        out, "/*\n * base = 0x40\n * top  = 0x80\n */\nint g(void);\n",
+        "bookend strip must not be undone by raw replay, got:\n{out}"
+    );
+}
+
+#[test]
 fn preformatted_label_row_on_an_inline_opener_keeps_its_strip() {
     // Line 0 of a "/* <content>" block took the raw-replay branch, which
     // rebuilds the line from bytes predating "strip_decorative_bookends". Its

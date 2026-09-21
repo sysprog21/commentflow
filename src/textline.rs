@@ -89,6 +89,80 @@ pub(crate) fn is_table_row(body: &str) -> bool {
     t.matches('|').count() >= 2 || (t.contains('\t') && t.split_whitespace().count() >= 3)
 }
 
+/// Narrows a row mask to the rows that sit in a maximal run of two or more
+/// adjacent ones: the shape that freezes instead of packing into a paragraph.
+///
+/// Requiring two is what keeps a sentence out. A lone "Note: ..." or
+/// "count = zero when the queue drained" is prose that happens to open like a
+/// row, and wrapping it is correct. Two or more adjacent rows are not one
+/// wrapped sentence, so the run freezes whole and whatever follows is simply
+/// the next paragraph -- releasing its last row to a prose tail would split
+/// one logical table, which is the damage this rule exists to prevent.
+pub(crate) fn keep_complete_row_runs(is_row: &mut [bool]) {
+    let mut prev = false;
+    for i in 0..is_row.len() {
+        let cur = is_row[i];
+        let next = is_row.get(i + 1).copied().unwrap_or(false);
+        is_row[i] = cur && (prev || next);
+        prev = cur;
+    }
+}
+
+/// One "X = Y" mapping row: a compact assignment or formula that documents a
+/// mapping rather than stating a sentence, so its one-row layout is the
+/// content. "ir->imm = immediate", "flags |= MASK", "imm   = value".
+///
+/// Shared by the classify stage and the merge stage, which must agree byte
+/// for byte on what a mapping row is.
+///
+/// What keeps prose out is the left-hand side: it must be exactly one
+/// code-like token. A sentence that happens to contain an equals sign
+/// ("the default width = 80 columns") has spaces on the left and is rejected
+/// here; a sentence that happens to START with one ("count = zero when the
+/// queue drained") is rejected by the run rule at the call site, not here.
+pub(crate) fn is_assignment_line(body: &str) -> bool {
+    let t = body.trim();
+
+    // The operator is the first '='. If it turns out to compare rather than
+    // assign, the '=' it leaves behind on the left fails the token test below,
+    // so no later '=' could rescue the line anyway.
+    let Some((lhs, rhs)) = t.split_once('=') else {
+        return false;
+    };
+
+    // "==" / "===" compare, "=>" is an arrow and "=<" is nothing at all; a
+    // right side of nothing is not a mapping either. Tested unspaced on
+    // purpose, so a genuine value like "x = <unknown>" still reads as one.
+    if rhs.starts_with(['=', '>', '<']) || rhs.trim().is_empty() {
+        return false;
+    }
+
+    let b = lhs.as_bytes();
+    let last = b.last().copied();
+    let prev = b.len().checked_sub(2).map(|j| b[j]);
+    let left = match last {
+        // "!=", and bare "<=" / ">=", compare; "<<=" / ">>=" assign.
+        Some(b'!') => return false,
+        Some(c @ (b'<' | b'>')) if prev != Some(c) => return false,
+        Some(b'<' | b'>') => &lhs[..lhs.len() - 2],
+        // Compound assignment: "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=".
+        Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^') => &lhs[..lhs.len() - 1],
+        _ => lhs,
+    }
+    .trim_end();
+
+    // One token, code-shaped, and short enough to be an identifier rather than
+    // a clause. Every accepted byte is ASCII, so the byte length is the char
+    // count; the cap is a sanity bound, not a real limit, and has to clear
+    // names like "ctx->sub->field[MAX_INDEX]".
+    !left.is_empty()
+        && left.len() <= 48
+        && left.bytes().any(|c| c.is_ascii_alphabetic() || c == b'_')
+        && left
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.->:[]()*%$".contains(&c))
+}
+
 pub(crate) fn is_indented_code(body: &str) -> bool {
     // Intentional content alignment: ≥2 leading spaces OR ≥1 leading tab. A
     // single leading ASCII space is too common as a wrap artifact (it can
@@ -133,6 +207,20 @@ pub(crate) fn is_horizontal_rule(body: &str) -> bool {
 
 pub(crate) fn is_art(body: &str) -> bool {
     if has_alpha_word_min4(body) {
+        return false;
+    }
+
+    // An assignment row's operator is content, not drawing. "=" is a member of
+    // the art alphabet, so a short mapping row like "a += b" clears the density
+    // threshold on the very characters that make it a row, and art would claim
+    // it after the run rule had deliberately declined to freeze it -- stranding
+    // the tail of the paragraph it belongs to, the damage the run rule exists
+    // to avoid. Whether a mapping row freezes is the run rule's alone. A
+    // rule-decorated line is excepted: released to prose, the packer can join
+    // "x += y ---" to a "--- label" above it and build a line ruled on both
+    // ends, which the next pass strips. Different bytes each pass, and
+    // "--check" would never settle. Decoration outranks the mapping reading.
+    if is_assignment_line(body) && bookend_match(body).is_none() && !one_sided_banner(body) {
         return false;
     }
     if ascii_art_density(body) {
